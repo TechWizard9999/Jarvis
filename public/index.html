@@ -1,0 +1,11 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>RTK Bugfix Agent</title><link rel="stylesheet" href="/style.css"><script src="/app.js" defer></script></head>
+<body><header><a class="brand" href="/">RTK <span>bugfix agent</span></a><span id="connection" class="pill">Connecting</span><button id="doctor">Check setup</button></header>
+<main><section class="intro"><p class="eyebrow">LOCAL WORKSPACE · INDEPENDENT VERIFICATION</p><h1>From reported bug<br>to a reviewable fix.</h1><p>Follow the evidence, inspect each change, and keep control of the result.</p></section>
+<section id="setup" class="setup" hidden><h2>Setup checks</h2><div id="setup-results"></div></section>
+<section class="launch"><form id="run-form"><label>Local repository<input id="repo" name="repo" placeholder="Loading repository profile…" required></label><label>GitHub issue<input id="issue" name="issue" type="url" placeholder="Loading issue scope…" required></label><div class="options"><label class="inline"><input id="publish" type="checkbox"> Create draft PR after verification</label><button type="submit" id="start">Start repair <span>→</span></button></div></form><div class="demo"><p>Explore the interface before configuring a real run.</p><button id="demo">Play labelled demo</button></div></section>
+<div id="error" role="alert" hidden></div>
+<section class="workspace"><aside><div class="section-heading"><h2>Runs</h2><button id="refresh">Refresh</button></div><div id="runs"><p class="muted">No runs yet.</p></div></aside>
+<article id="detail"><div class="empty"><div class="mark">↗</div><h2>Your next fix starts here.</h2><p>Start a repair or play the demo to see the workflow.</p></div></article></section>
+</main><footer>Original checkout preserved · Repository execution isolated · Human review before merge</footer>
+</body></html>
