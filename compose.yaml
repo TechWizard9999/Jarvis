@@ -1,0 +1,74 @@
+name: rtk-bugfix-agent
+services:
+  controller:
+    image: ${BUGFIX_CONTROLLER_IMAGE:-bugfix-controller:0.1}
+    build:
+      context: .
+      dockerfile: docker/controller.Dockerfile
+    init: true
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${BUGFIX_PORT:-3210}:3210"
+    environment:
+      BUGFIX_PROJECT_DIR: ${BUGFIX_PROJECT_DIR:?Run ./bugfix setup first}
+      BUGFIX_STATE_DIR: ${BUGFIX_STATE_DIR:?Run ./bugfix setup first}
+      BUGFIX_REPO_ROOT: ${BUGFIX_REPO_ROOT:?Run ./bugfix setup first}
+      BUGFIX_BIND: 0.0.0.0
+      BUGFIX_PORT: 3210
+      BUGFIX_CONTROLLER_URL: http://controller:3210
+      BUGFIX_PROFILE: /app/profiles/${BUGFIX_PROFILE_NAME:-rtk}.json
+      BUGFIX_PROVIDER_BASE_URL: ${BUGFIX_PROVIDER_BASE_URL:-https://integrate.api.nvidia.com/v1/}
+      BUGFIX_NETWORK: ${BUGFIX_NETWORK:-bugfix-control}
+      BUGFIX_WORKER_IMAGE: ${BUGFIX_WORKER_IMAGE:-bugfix-worker:0.1}
+      BUGFIX_AGENT_IMAGE: ${BUGFIX_AGENT_IMAGE:-bugfix-opencode:0.1}
+      BUGFIX_PUBLISHER_IMAGE: ${BUGFIX_PUBLISHER_IMAGE:-bugfix-publisher:0.1}
+      BUGFIX_MAX_ATTEMPTS: ${BUGFIX_MAX_ATTEMPTS:-3}
+      BUGFIX_MODEL: ${BUGFIX_MODEL:-}
+      BUGFIX_MODEL_CONTEXT: ${BUGFIX_MODEL_CONTEXT:-131072}
+      BUGFIX_MODEL_MAX_OUTPUT: ${BUGFIX_MODEL_MAX_OUTPUT:-8192}
+      BUGFIX_FORK: ${BUGFIX_FORK:-}
+      BUGFIX_GIT_NAME: ${BUGFIX_GIT_NAME:-}
+      BUGFIX_GIT_EMAIL: ${BUGFIX_GIT_EMAIL:-}
+      BUGFIX_RUST_TOOLCHAIN: ${BUGFIX_RUST_TOOLCHAIN:-1.99.1}
+      BUGFIX_COMMAND_TIMEOUT_MS: ${BUGFIX_COMMAND_TIMEOUT_MS:-900000}
+      BUGFIX_MEMORY: ${BUGFIX_MEMORY:-4g}
+      BUGFIX_CPUS: ${BUGFIX_CPUS:-2}
+    volumes:
+      - "${BUGFIX_PROJECT_DIR}/profiles:/app/profiles:ro"
+      - "${DOCKER_SOCKET:-/var/run/docker.sock}:/var/run/docker.sock"
+      - "${BUGFIX_REPO_ROOT}:${BUGFIX_REPO_ROOT}"
+      - "${BUGFIX_STATE_DIR}:${BUGFIX_STATE_DIR}"
+      - "${BUGFIX_PROJECT_DIR}/.secrets/nvidia_api_key:${BUGFIX_PROJECT_DIR}/.secrets/nvidia_api_key:ro"
+    networks: [control]
+    healthcheck:
+      test: ["CMD", "node", "-e", "require('http').get('http://127.0.0.1:3210/',r=>process.exit(r.statusCode===401?0:1)).on('error',()=>process.exit(1))"]
+      interval: 15s
+      timeout: 5s
+      retries: 4
+  worker-image:
+    image: ${BUGFIX_WORKER_IMAGE:-bugfix-worker:0.1}
+    profiles: [images]
+    build:
+      context: .
+      dockerfile: docker/worker.Dockerfile
+      args:
+        RUST_TOOLCHAIN: ${BUGFIX_RUST_TOOLCHAIN:-1.99.1}
+    command: ["true"]
+  opencode-image:
+    image: ${BUGFIX_AGENT_IMAGE:-bugfix-opencode:0.1}
+    profiles: [images]
+    build:
+      context: .
+      dockerfile: docker/opencode.Dockerfile
+    entrypoint: ["true"]
+  publisher-image:
+    image: ${BUGFIX_PUBLISHER_IMAGE:-bugfix-publisher:0.1}
+    profiles: [images]
+    build:
+      context: .
+      dockerfile: docker/publisher.Dockerfile
+    entrypoint: ["true"]
+networks:
+  control:
+    name: ${BUGFIX_NETWORK:-bugfix-control}
+    external: true

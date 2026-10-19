@@ -1,0 +1,79 @@
+{
+  "id": "rtk",
+  "adapter": "cargo-rust",
+  "upstream": "rtk-ai/rtk",
+  "baseBranch": "develop",
+  "packageName": "rtk",
+  "manifest": "Cargo.toml",
+  "sourceRoots": [
+    "src"
+  ],
+  "testRoots": [
+    "tests"
+  ],
+  "fixtureRoot": "tests/fixtures",
+  "maxChangedFiles": 8,
+  "maxSourceFiles": 3,
+  "focusedTestPrefix": [
+    "cargo",
+    "test",
+    "-p",
+    "rtk",
+    "--lib",
+    "--locked",
+    "--offline"
+  ],
+  "fastCheckIds": [
+    "fmt",
+    "clippy-default"
+  ],
+  "checks": {
+    "fmt": [
+      "cargo",
+      "fmt",
+      "--all",
+      "--",
+      "--check"
+    ],
+    "clippy-default": [
+      "cargo",
+      "clippy",
+      "--workspace",
+      "--all-targets",
+      "--locked",
+      "--offline"
+    ],
+    "test-workspace": [
+      "cargo",
+      "test",
+      "--workspace",
+      "--locked",
+      "--offline"
+    ],
+    "clippy-oss": [
+      "cargo",
+      "clippy",
+      "--no-default-features",
+      "--all-targets",
+      "--locked",
+      "--offline"
+    ],
+    "test-oss": [
+      "cargo",
+      "test",
+      "--no-default-features",
+      "--locked",
+      "--offline"
+    ],
+    "docs": [
+      "cargo",
+      "doc",
+      "--no-deps",
+      "--locked",
+      "--offline"
+    ]
+  },
+  "skipTests": {
+    "hooks::init::pi::tests::test_global_uninstall_detects_shared_pi_omp_extension": "Creates a relative .omp directory in the crate root (fs::create_dir_all(OMP_LOCAL_DIR) in src/hooks/init/pi.rs), which the read-only source mount forbids; it passes in upstream CI, where the checkout is writable."
+  }
+}

@@ -1,0 +1,9 @@
+node_modules
+.pnpm-store
+.git
+.env
+.secrets
+state
+.cache
+repos
+playwright-output

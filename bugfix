@@ -1,0 +1,35 @@
+#!/bin/sh
+set -eu
+# Docker Desktop's credential helper is not always linked into a fresh shell PATH.
+if [ -d /Applications/Docker.app/Contents/Resources/bin ]; then
+  PATH="/Applications/Docker.app/Contents/Resources/bin:$PATH"
+  export PATH
+fi
+BUGFIX_ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+cd "$BUGFIX_ROOT"
+command=${1:-help}
+if [ "$#" -gt 0 ]; then shift; fi
+case "$command" in
+  setup) exec python3 scripts/setup.py "$@" ;;
+  build) docker compose --profile images build "$@" ;;
+  up)
+    BUGFIX_NETWORK_NAME=$(python3 scripts/setup.py --value BUGFIX_NETWORK --default bugfix-control)
+    docker network inspect "$BUGFIX_NETWORK_NAME" >/dev/null 2>&1 || docker network create "$BUGFIX_NETWORK_NAME" >/dev/null
+    docker compose up --build -d controller
+    printf '\nDashboard: http://localhost:%s/?token=' "$(python3 scripts/setup.py --value BUGFIX_PORT --default 3210)"
+    attempt=0
+    BUGFIX_STATE_PATH=$(python3 scripts/setup.py --value BUGFIX_STATE_DIR --default "$BUGFIX_ROOT/state")
+    while [ ! -s "$BUGFIX_STATE_PATH/ui-token" ] && [ "$attempt" -lt 40 ]; do sleep 1; attempt=$((attempt+1)); done
+    if [ -s "$BUGFIX_STATE_PATH/ui-token" ]; then cat "$BUGFIX_STATE_PATH/ui-token"; printf '\n'; else printf 'Controller is still starting. Run ./bugfix logs.\n'; fi
+    ;;
+  down) docker compose down ;;
+  logs) docker compose logs --tail 100 -f controller ;;
+  clone|clone-rtk) exec python3 scripts/setup.py --clone "$@" ;;
+  test) docker compose exec -T controller node --test /app/tests/*.test.ts ;;
+  fix)
+    # A run pauses while the Mac sleeps; keep it awake (idle sleep, and system sleep on AC power) until the run reports its outcome.
+    if command -v caffeinate >/dev/null 2>&1; then exec caffeinate -i -s docker compose exec -T controller node src/cli.ts fix "$@"; fi
+    exec docker compose exec -T controller node src/cli.ts fix "$@" ;;
+  doctor|run|list|tail|cancel|publish|demo) exec docker compose exec -T controller node src/cli.ts "$command" "$@" ;;
+  *) printf '%s\n' 'RTK Bugfix Agent' './bugfix setup [--install-docker] [--clone]' './bugfix build' './bugfix up' './bugfix doctor' './bugfix fix https://github.com/rtk-ai/rtk/issues/NUMBER    (RCA + verified patch + draft PR link)' './bugfix run --repo /absolute/path/to/rtk --issue https://github.com/rtk-ai/rtk/issues/NUMBER --publish' './bugfix demo | list | tail ID | cancel ID | publish ID | down | logs' ;;
+esac

@@ -1,0 +1,10 @@
+node_modules/
+.pnpm-store/
+.env
+.secrets/
+state/
+.cache/
+repos/
+playwright-output/
+*.log
+.DS_Store
