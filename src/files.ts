@@ -3,7 +3,7 @@ import path from 'node:path';
 import { createHash } from 'node:crypto';
 export const hash = (value: string | Buffer) => createHash('sha256').update(value).digest('hex');
 export function safeRelative(value: string): string {
-  if (!value || value.length > 500 || value.includes('\\') || /[\x00-\x1f]/.test(value) || path.posix.isAbsolute(value)) throw new Error('Invalid relative path');
+  if (!value || value.length > 500 || value.includes('\\') || /[\x00-\x1f]/.test(value) || path.posix.isAbsolute(value)) throw new Error('Invalid relative path: use a repository-relative path such as src/lib.rs. Use a dot only for search_text directory listing. Absolute paths including /agent and /workspace are not source paths.');
   const parts = value.split('/');
   if (parts.some(p => !p || p === '.' || p === '..' || p === '.git') || parts[0] === 'target') throw new Error('Path is outside source policy');
   return value;
@@ -18,10 +18,12 @@ export async function sourcePath(root: string, relative: string, allowMissing = 
   }
   return destination;
 }
-export async function inventory(root: string): Promise<Record<string, string>> {
+export async function inventory(root: string, signal?: AbortSignal): Promise<Record<string, string>> {
   const output: Record<string, string> = {};
   async function visit(dir: string, prefix: string) {
+    signal?.throwIfAborted();
     for (const ent of (await fs.readdir(dir, { withFileTypes: true })).sort((a, b) => a.name.localeCompare(b.name))) {
+      signal?.throwIfAborted();
       if (ent.name === '.git' || ent.name === 'target' || ent.name === 'graphify-out') continue;
       const rel = prefix + ent.name; safeRelative(rel);
       if (ent.isSymbolicLink()) throw new Error(`Source symlink is unsupported: ${rel}`);
@@ -33,9 +35,9 @@ export async function inventory(root: string): Promise<Record<string, string>> {
   await visit(root, ''); return output;
 }
 export const fingerprint = (entries: Record<string, string>) => hash(JSON.stringify(Object.entries(entries).sort(([a], [b]) => a.localeCompare(b))));
-export async function copySource(from: string, to: string) {
-  await inventory(from); await fs.mkdir(to, { recursive: true });
-  await fs.cp(from, to, { recursive: true, filter: source => !['.git', 'target', 'graphify-out'].includes(path.basename(source)) });
+export async function copySource(from: string, to: string, signal?: AbortSignal) {
+  await inventory(from, signal); signal?.throwIfAborted(); await fs.mkdir(to, { recursive: true });
+  await fs.cp(from, to, { recursive: true, filter: source => { signal?.throwIfAborted(); return !['.git', 'target', 'graphify-out'].includes(path.basename(source)); } }); signal?.throwIfAborted();
 }
 export function changedFiles(before: Record<string, string>, after: Record<string, string>) {
   return [...new Set([...Object.keys(before), ...Object.keys(after)])].filter(p => before[p] !== after[p]).sort();

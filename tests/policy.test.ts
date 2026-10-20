@@ -5,6 +5,7 @@ import path from 'node:path';
 import { copySource, applyEdits, sourcePath, safeRelative } from '../src/files.ts';
 import { assertCandidate, assertFrozen, freezeRegression, inFileTestName, regressionPassed, reproductionFailure } from '../src/policy.ts';
 import { tempConfig, fixtureRepo, spec, withRegression, testName, original } from './helpers.ts';
+import { defaultProfile } from '../src/profile.ts';
 
 test('rejects path traversal, hidden Git metadata and symlinks', async t => {
   const { root } = await tempConfig(); t.after(() => fs.rm(root, { recursive: true, force: true }));
@@ -74,4 +75,79 @@ test('an inline snapshot expectation requires a review flag and cannot change th
   await assertCandidate(base, source, frozen, flagged);
   await fs.writeFile(path.join(source, spec.file), fixed.replace('!("actual",', '!("different expression",'));
   await assert.rejects(assertCandidate(base, source, frozen, flagged), /snapshot policy/);
+});
+
+test('preexisting Rust integration helpers cannot be weakened without changing a test body', async t => {
+  const { root, config } = await tempConfig(); t.after(() => fs.rm(root, { recursive: true, force: true }));
+  const base = await fixtureRepo(config.repoRoot), source = path.join(root, 'source');
+  await fs.mkdir(path.join(base, 'tests/support'), { recursive: true });
+  await fs.writeFile(path.join(base, 'tests/support/mod.rs'), 'pub fn success(status: i32) { assert_eq!(status, 0); }\n');
+  await copySource(base, source); await fs.writeFile(path.join(source, spec.file), withRegression);
+  const frozen = await freezeRegression(base, source, spec);
+  await fs.writeFile(path.join(source, spec.file), withRegression.replace('!line.starts_with("error:")', '!line.is_empty()'));
+  await fs.writeFile(path.join(source, 'tests/support/mod.rs'), 'pub fn success(_: i32) {}\n');
+  await assert.rejects(assertCandidate(base, source, frozen, { explanation: 'Preserve reported errors.', evidenceIds: [1, 2] }), /Existing test-root file/);
+});
+
+test('standalone test-only helpers and macro tests retain their assertions', async t => {
+  const { root, config } = await tempConfig(); t.after(() => fs.rm(root, { recursive: true, force: true }));
+  const base = await fixtureRepo(config.repoRoot), source = path.join(root, 'source');
+  const support = '#[cfg(test)] fn expected() -> bool { true }\n#[tokio::test] async fn macro_test() { assert!(expected()); }\n';
+  await fs.writeFile(path.join(base, spec.file), original + support);
+  await copySource(base, source); await fs.writeFile(path.join(source, spec.file), withRegression + support);
+  const frozen = await freezeRegression(base, source, spec);
+  const fixed = (withRegression + support).replace('!line.starts_with("error:")', '!line.is_empty()');
+  for (const weakened of [fixed.replace('-> bool { true }', '-> bool { false }'), fixed.replace('assert!(expected())', 'assert!(true)')]) {
+    await fs.writeFile(path.join(source, spec.file), weakened);
+    await assert.rejects(assertCandidate(base, source, frozen, { explanation: 'Preserve reported errors.', evidenceIds: [1, 2] }), /Existing test|test-only support/);
+  }
+});
+
+test('reproduction requires a substantive expected behavior and issue citation', async t => {
+  const { root, config } = await tempConfig(); t.after(() => fs.rm(root, { recursive: true, force: true }));
+  const base = await fixtureRepo(config.repoRoot), source = path.join(root, 'source'); await copySource(base, source);
+  await fs.writeFile(path.join(source, spec.file), withRegression);
+  await assert.rejects(freezeRegression(base, source, { ...spec, citation: '' }), /citation/);
+  await assert.rejects(freezeRegression(base, source, { ...spec, expectedBehavior: ' ' }), /expected behavior/);
+});
+
+test('external test-only source modules and their nested helpers are preserved', async t => {
+  const { root, config } = await tempConfig(); t.after(() => fs.rm(root, { recursive: true, force: true }));
+  const base = await fixtureRepo(config.repoRoot), source = path.join(root, 'source');
+  const declaration = '\n#[cfg(test)] mod support;\n';
+  await fs.writeFile(path.join(base, spec.file), original + declaration);
+  await fs.mkdir(path.join(base, 'src/support'), { recursive: true });
+  await fs.writeFile(path.join(base, 'src/support.rs'), 'mod nested; pub fn check(value: bool) { nested::check(value); }\n');
+  await fs.writeFile(path.join(base, 'src/support/nested.rs'), 'pub fn check(value: bool) { assert!(value); }\n');
+  await copySource(base, source); await fs.writeFile(path.join(source, spec.file), withRegression + declaration);
+  const frozen = await freezeRegression(base, source, spec);
+  await fs.writeFile(path.join(source, spec.file), (withRegression + declaration).replace('!line.starts_with("error:")', '!line.is_empty()'));
+  await fs.writeFile(path.join(source, 'src/support/nested.rs'), 'pub fn check(_: bool) {}\n');
+  await assert.rejects(assertCandidate(base, source, frozen, { explanation: 'Preserve reported errors.', evidenceIds: [1, 2] }), /External test-only|test-only support/);
+});
+
+test('production fixes cannot add test-only shortcuts or weaken opaque test macros', async t => {
+  const { root, config } = await tempConfig(); t.after(() => fs.rm(root, { recursive: true, force: true }));
+  const base = await fixtureRepo(config.repoRoot), source = path.join(root, 'source');
+  const macro = '\n#[cfg(unix)] mod generated { proptest! { #[test] fn generated(value in 1..10) { assert!(value > 0); } }\nmacro_rules! generated_tests { () => { #[test] fn generated() { assert!(1 > 0); } } } }\n';
+  await fs.writeFile(path.join(base, spec.file), original + macro);
+  await copySource(base, source); await fs.writeFile(path.join(source, spec.file), withRegression + macro);
+  const frozen = await freezeRegression(base, source, spec);
+  for (const invalid of [(withRegression + macro).replace('!line.starts_with("error:")', 'cfg!(test) || !line.starts_with("error:")'), (withRegression + macro).replace('assert!(value > 0)', 'assert!(true)'), (withRegression + macro).replace('assert!(1 > 0)', 'assert!(true)'), (withRegression + macro).replace('#[cfg(unix)]', '#[cfg(windows)]')]) {
+    await fs.writeFile(path.join(source, spec.file), invalid);
+    await assert.rejects(assertCandidate(base, source, frozen, { explanation: 'Preserve reported errors.', evidenceIds: [1, 2] }), /test-only|unsupported test syntax/);
+  }
+  await fs.writeFile(path.join(source, spec.file), (withRegression + macro).replace('!line.starts_with("error:")', '!line.is_empty()'));
+  await fs.writeFile(path.join(source, 'src/shortcut.rs'), 'pub fn preserve(_: &str) -> bool { cfg!(test) }\n');
+  await assert.rejects(assertCandidate(base, source, frozen, { explanation: 'Preserve reported errors.', evidenceIds: [1, 2] }), /test-only|unsupported test syntax/);
+});
+
+test('a relevant skipped check blocks a complete candidate verdict', async t => {
+  const { root, config } = await tempConfig(); t.after(() => fs.rm(root, { recursive: true, force: true }));
+  const base = await fixtureRepo(config.repoRoot), source = path.join(root, 'source'); await copySource(base, source);
+  await fs.writeFile(path.join(source, spec.file), withRegression); const frozen = await freezeRegression(base, source, spec);
+  await fs.writeFile(path.join(source, spec.file), withRegression.replace('!line.starts_with("error:")', '!line.is_empty()'));
+  const profile = { ...defaultProfile, skipTests: { 'tests::read_only_case': 'Requires a writable source mount.' }, skipTestOwners: { 'tests::read_only_case': ['src/lib.rs'] } };
+  await assert.rejects(assertCandidate(base, source, frozen, { explanation: 'Preserve reported errors.', evidenceIds: [1, 2] }, profile), /skipped.*tests::read_only_case|tests::read_only_case.*skipped/i);
+  await assertCandidate(base, source, frozen, { explanation: 'Preserve reported errors.', evidenceIds: [1, 2] }, { ...profile, skipTestOwners: { 'tests::read_only_case': ['src/unrelated.rs'] } });
 });

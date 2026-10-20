@@ -41,7 +41,7 @@ try {
   if(remoteHead && remoteHead.split(/\s+/)[0]!==input.commit)throw Error('Remote branch has different content; refusing to overwrite it');
   git(['push',remote,`HEAD:refs/heads/${input.branch}`]);
   const head=input.fork.toLowerCase()===input.upstream.toLowerCase()?input.branch:`${owner}:${input.branch}`;
-  const url=command('gh',['pr','create','--draft','--repo',input.upstream,'--base',input.base,'--head',head,'--title',`fix: resolve issue #${input.issue}`,'--body-file','/publish/body.md']);
+  const url=command('gh',['pr','create','--draft','--repo',input.upstream,'--base',input.base,'--head',head,'--title',typeof input.title==='string' && input.title.length<=120 && !/[\r\n\x00-\x1f]/.test(input.title) ? input.title : `fix: resolve issue #${input.issue}`,'--body-file','/publish/body.md']);
   const pr=JSON.parse(command('gh',['api',`repos/${input.upstream}/pulls/${url.split('/').at(-1)}`]));
   if(pr.head.sha!==input.commit || !pr.draft || pr.base.ref!==input.base || pr.head.repo.full_name.toLowerCase()!==input.fork.toLowerCase())throw Error('Created PR metadata differs from the verified publication identity');
   await save({url:pr.html_url,commit:pr.head.sha,draft:true});console.log(pr.html_url);

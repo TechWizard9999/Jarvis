@@ -27,6 +27,11 @@ const server = http.createServer(async (request, response) => {
   if (url.pathname === '/api/runs') return json(response, [run]);
   if (url.pathname === `/api/runs/${run.id}`) return json(response, run);
   if (url.pathname === `/api/runs/${run.id}/diff`) return json(response, { diff: '' });
+  if (url.pathname === `/api/runs/${run.id}/history`) {
+    const before=Number(url.searchParams.get('before') || Infinity),limit=Number(url.searchParams.get('limit') || 500);
+    const matches=events.filter(event=>event.seq<before);const page=matches.slice(-limit);
+    return json(response,{events:page,hasOlder:matches.length>page.length,before:page[0]?.seq,latestSeq:events.at(-1)?.seq || 0});
+  }
   if (url.pathname === `/api/runs/${run.id}/events`) {
     response.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache' });
     subscribers.add(response);
@@ -70,11 +75,11 @@ try {
   assert.ok(Math.abs((await position()).top - paused.top) <= 2, 'switching tabs should preserve the reading position');
 
   for (let i = 83; i <= 1530; i++) send(`event ${i}`);
-  await page.waitForFunction(() => document.querySelectorAll('.logrow').length === 1530);
-  assert.ok(Math.abs((await position()).top - paused.top) <= 2, 'older rows should remain while reading the stream');
+  await page.waitForFunction(() => document.querySelectorAll('.logrow').length === 1500);
+  assert.ok(Math.abs((await position()).top - paused.top) <= 2, 'a bounded Activity window preserves the reading position');
 
   await page.locator('.log').evaluate(node => { node.scrollTop = node.scrollHeight; });
-  await page.waitForFunction(() => document.querySelectorAll('.logrow').length === 1500);
+  await page.getByText('event 1530', { exact: true }).waitFor();
   send('event 1531');
   await page.getByText('event 1531', { exact: true }).waitFor();
   assert.ok((await position()).remaining < 40, 'scrolling to the end should resume following the stream');

@@ -1,8 +1,9 @@
+import { providerBody, providerRetrySeconds } from './provider.ts';
 import { setTimeout as sleep } from 'node:timers/promises';
 import http from 'node:http';
 import fs from 'node:fs/promises';
 import path from 'node:path';
-import { randomBytes, timingSafeEqual } from 'node:crypto';
+import { randomBytes, timingSafeEqual, createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { Pipeline } from './pipeline.ts';
 import { Store } from './store.ts';
@@ -10,7 +11,7 @@ import { demo } from './demo.ts';
 import { doctor } from './doctor.ts';
 import { filterProviderTools } from './agent.ts';
 import { safeRelative, sourcePath } from './files.ts';
-import type { Config, RunEvent } from './types.ts';
+import type { Config, RunEvent, Manifest } from './types.ts';
 
 const publicDir = fileURLToPath(new URL('../public/', import.meta.url));
 const equal = (a: string, b: string) => { const x = Buffer.from(a), y = Buffer.from(b); return x.length === y.length && timingSafeEqual(x, y); };
@@ -26,7 +27,7 @@ export async function createServer(config: Config, options: { recover?: boolean;
   await fs.writeFile(tokenFile, uiToken, { mode: 0o600 });
   const store = new Store(config.stateDir); const pipeline = new Pipeline(config, store);
   if (options.recover !== false) await pipeline.recover();
-  const json = (res: http.ServerResponse, data: unknown, code = 200) => { res.writeHead(code, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' }); res.end(JSON.stringify(data)); };
+  const json = (res: http.ServerResponse, data: unknown, code = 200) => { if(res.destroyed || res.writableEnded)return;res.writeHead(code, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' }); res.end(JSON.stringify(data)); };
   const server = http.createServer(async (req, res) => {
     try {
       const url = new URL(req.url || '/', 'http://localhost');
@@ -51,13 +52,27 @@ export async function createServer(config: Config, options: { recover?: boolean;
         const key = (await fs.readFile(config.nvidiaSecret, 'utf8')).trim();
         if (!key || /\s/.test(key)) throw new Error('NVIDIA secret file is empty or invalid');
         // Per-request output is capped at the model's configured limit; total usage is only reported, never capped.
-        const body = { ...filtered.body, max_tokens: Math.min(Number(input.max_tokens) || config.modelMaxOutput, config.modelMaxOutput) };
-        await store.event(context.run, 'gateway', 'model_request', 'Approved outbound model tool list', { tools: filtered.names, removedTools: filtered.removed, model: input.model });
+        const body = providerBody(filtered.body,config);
         const target = new URL(config.providerBaseUrl.endsWith('/') ? config.providerBaseUrl : config.providerBaseUrl + '/');
         if (target.protocol !== 'https:' || target.username || target.password) throw new Error('The NVIDIA endpoint must be a credential-free HTTPS URL');
+        const settings = Object.fromEntries(['model','max_tokens','temperature','top_p','top_k','min_p','seed','presence_penalty','frequency_penalty','reasoning_effort','reasoning_budget'].filter(key => ['string','number','boolean'].includes(typeof (body as Record<string, unknown>)[key])).map(key => [key,(body as Record<string, unknown>)[key]]));
+        for(const [key,fields] of [['thinking',['type','budget_tokens']],['reasoning',['effort','max_tokens','summary']],['chat_template_kwargs',['enable_thinking']]] as const){const source=(body as Record<string, any>)[key];if(source && typeof source==='object')settings[key]=Object.fromEntries(fields.filter(field=>['string','number','boolean'].includes(typeof source[field])).map(field=>[field,source[field]]));}
+        const hash = (value: unknown) => createHash('sha256').update(JSON.stringify(value)).digest('hex');
+        const record: NonNullable<Manifest['modelRequests']>[number] & {settings: Record<string, unknown>; settingsSha256: string; promptSha256: string} = {id:randomBytes(12).toString('hex'),startedAt:new Date().toISOString(),attempts:0,model:input.model,usage:'unknown',status:'pending',settings,settingsSha256:hash(settings),promptSha256:hash(input.messages || [])};
+        (context.run.modelRequests ||= []).push(record); await store.save(context.run);
+        await store.event(context.run, 'gateway', 'model_request', 'Approved outbound model tool list', {requestId:record.id,tools:filtered.names,removedTools:filtered.removed,model:input.model,settings,settingsSha256:record.settingsSha256,promptSha256:record.promptSha256});
         // One request lives until the run is cancelled or the agent disconnects (OpenCode then sends a new request).
+        let completed = false, interrupted = false;
+        const readUsage = (data: any) => {
+          const usage=data?.usage;if(!usage || typeof usage!=='object')return;
+          const count=(...keys: string[])=>{for(const key of keys){const value=usage[key];if(typeof value==='number' && Number.isFinite(value) && value>=0)return value;}return undefined;};
+          const input=count('prompt_tokens','input_tokens'),output=count('completion_tokens','output_tokens'),total=count('total_tokens');
+          if(input!==undefined)record.inputTokens=Math.max(record.inputTokens ?? 0,input);if(output!==undefined)record.outputTokens=Math.max(record.outputTokens ?? 0,output);
+          const observed=total ?? (input!==undefined && output!==undefined?input+output:undefined);if(observed!==undefined)record.totalTokens=Math.max(record.totalTokens ?? 0,observed);
+          if(input!==undefined || output!==undefined || observed!==undefined)record.usage='partial';
+        };
         const request = new AbortController(); const stopRequest = () => request.abort(context.abort.signal.reason);
-        context.abort.signal.addEventListener('abort', stopRequest, { once: true });
+        context.abort.signal.addEventListener('abort', stopRequest, { once: true });if(context.abort.signal.aborted || res.destroyed)stopRequest();
         res.on('close', () => { if (!res.writableEnded) request.abort(new Error('Agent disconnected from the model gateway')); });
         try {
           // Wait out rate limits (every 429) and transient provider/network failures (5xx or connection errors, 5 times) here
@@ -66,7 +81,9 @@ export async function createServer(config: Config, options: { recover?: boolean;
           for (let attempt = 0; ; attempt++) {
             let problem = ''; upstream = undefined;
             try {
+              request.signal.throwIfAborted();record.attempts++;
               upstream = await (options.providerRequest || fetch)(target.href.replace(/\/$/, '') + '/chat/completions', { method: 'POST', headers: { authorization: `Bearer ${key}`, 'content-type': 'application/json' }, body: JSON.stringify(body), signal: request.signal });
+              record.httpStatus=upstream.status;
               if ([401, 403, 404].includes(upstream.status)) context.providerRejected = `HTTP ${upstream.status}`; // bad key or unknown model
               if (upstream.status === 429) problem = 'HTTP 429';
               else if (upstream.status >= 500 && ++failures <= 5) problem = `HTTP ${upstream.status}`;
@@ -76,34 +93,41 @@ export async function createServer(config: Config, options: { recover?: boolean;
               if (request.signal.aborted || ++failures > 5) return res.headersSent ? res.destroy() : json(res, { error: `Model provider unreachable: ${String(error)}` }, 502);
               problem = String(error);
             }
-            const header = upstream?.headers.get('retry-after')?.trim();
-            const seconds = Math.max(1, Math.min(30, header && Number.isFinite(Number(header)) ? Number(header) : 2 ** Math.min(attempt + 1, 5)));
+            const seconds = providerRetrySeconds(upstream?.headers,attempt);
             await store.event(context.run, 'gateway', problem === 'HTTP 429' ? 'rate_limited' : 'provider_retry', `Model ${problem}; retrying in ${seconds}s`);
             await sleep(seconds * 1000, undefined, { signal: request.signal });
           }
+          if(res.destroyed || res.writableEnded || request.signal.aborted)return;
           res.writeHead(upstream.status, { 'content-type': upstream.headers.get('content-type') || 'application/json', 'cache-control': 'no-store' });
-          if (!upstream.body) return res.end();
-          let buffer = '', used = 0; const decoder = new TextDecoder();
+          if (!upstream.body) {completed=true;return res.end();}
+          let buffer = ''; const decoder = new TextDecoder();
           try {
             for await (const chunk of upstream.body) {
+              if(res.destroyed || res.writableEnded || request.signal.aborted)throw new Error('Model response disconnected');
               res.write(chunk); buffer += decoder.decode(chunk, { stream: true });
               let index: number;
               while ((index = buffer.indexOf('\n')) >= 0) {
                 const line = buffer.slice(0, index).replace(/^data:\s*/, '').trim(); buffer = buffer.slice(index + 1);
-                try { const data = JSON.parse(line); used = Math.max(used, Number(data.usage?.total_tokens || 0)); } catch {}
+                try {readUsage(JSON.parse(line));}catch {}
               }
               if (buffer.length > 1_000_000) buffer = buffer.slice(-100000);
             }
           } catch (error) {
             // A broken stream must reach OpenCode as a transport error, not as a silently truncated (retry-less) answer.
+            interrupted=true;
             await store.event(context.run, 'gateway', 'model_error', `Model stream interrupted: ${String(error)}`); return res.destroy();
           }
-          try { const data = JSON.parse(buffer); used = Math.max(used, Number(data.usage?.total_tokens || 0)); } catch {}
-          context.run.tokens += used;
+          try {readUsage(JSON.parse(buffer));}catch {}
+          completed=true;return res.end();
+        } finally {
+          context.abort.signal.removeEventListener('abort', stopRequest);
+          record.finishedAt=new Date().toISOString();record.latencyMs=Math.max(0,Date.parse(record.finishedAt)-Date.parse(record.startedAt));
+          record.status=completed?(record.httpStatus && record.httpStatus>=400?'failed':'completed'):interrupted || request.signal.aborted?'interrupted':'failed';
+          if(completed && record.totalTokens!==undefined)record.usage='complete';
+          context.run.tokens+=record.totalTokens ?? 0;
           await store.save(context.run);
-          await store.event(context.run, 'gateway', upstream.ok ? 'model_finished' : 'model_error', `Model HTTP ${upstream.status}; reported tokens ${used}`);
-          return res.end();
-        } finally { context.abort.signal.removeEventListener('abort', stopRequest); }
+          await store.event(context.run,'gateway',record.status==='completed'?'model_finished':'model_error',`Model ${record.httpStatus?`HTTP ${record.httpStatus}`:record.status}; reported tokens ${record.totalTokens ?? 'unknown'} (${record.usage})`,{requestId:record.id,...record});
+        }
       }
       const browserOrigin = req.headers.origin;
       if (browserOrigin && new URL(browserOrigin).host !== req.headers.host) return json(res, { error: 'Cross-origin requests are not permitted' }, 403);
@@ -123,29 +147,47 @@ export async function createServer(config: Config, options: { recover?: boolean;
       if (url.pathname === '/api/runs' && req.method === 'GET') return json(res, await store.list());
       if (url.pathname === '/api/runs' && req.method === 'POST') return json(res, await pipeline.start(await jsonBody(req)), 202);
       if (url.pathname === '/api/demo' && req.method === 'POST') return json(res, await demo(store, config.profile), 202);
-      const route = /^\/api\/runs\/([a-z0-9-]+)(?:\/(events|cancel|publish|artifact|diff))?$/.exec(url.pathname);
+      const route = /^\/api\/runs\/([a-z0-9-]+)(?:\/(events|history|cancel|publish|publication|interventions|artifact|diff))?$/.exec(url.pathname);
       if (route) {
-        const [, id, action] = route; const run = await store.get(id);
+        const [, id, action] = route; const run = await store.get(id);if(res.destroyed || res.writableEnded)return;
         if (!action && req.method === 'GET') return json(res, run);
+        if (action === 'interventions' && req.method === 'POST') { const note=await jsonBody(req,20000); return json(res,await pipeline.recordIntervention(id,note.kind,note.message)); }
         if (action === 'cancel' && req.method === 'POST') { await pipeline.cancel(id); return json(res, { cancelling: true }); }
+        if (action === 'publication' && req.method === 'GET') return json(res, await pipeline.refreshPublication(id));
         if (action === 'publish' && req.method === 'POST') return json(res, await pipeline.retryPublication(id));
         if (action === 'diff' && req.method === 'GET') { const diff = await fs.readFile(path.join(store.dir(id), 'candidate.patch'), 'utf8').catch(async () => run.worktree ? (await pipeline.repository.git(run.worktree, ['diff', 'HEAD', '--no-ext-diff', '--no-textconv'])).stdout : ''); return json(res, { diff }); }
+        if (action === 'history' && req.method === 'GET') {
+          const number = (key: string) => { const value = url.searchParams.get(key); if (value === null) return undefined; const parsed = Number(value); if (!Number.isSafeInteger(parsed) || parsed < 0) throw new Error(`Invalid ${key} cursor`); return parsed; };
+          return json(res, await store.eventPage(id, {before:number('before'),after:number('after'),limit:number('limit'),search:url.searchParams.get('search') || undefined,stage:url.searchParams.get('stage') || undefined,source:url.searchParams.get('source') || undefined,errors:url.searchParams.get('errors') === 'true'}));
+        }
         if (action === 'artifact' && req.method === 'GET') {
           const relative = safeRelative(url.searchParams.get('path') || 'report.md');
-          if (!/^(?:report(?:-pr)?\.md|candidate\.patch|manifest\.json|events\.jsonl|graph-manifest\.json|(?:reproduction|verification|candidates)\/.+\.(?:log|json|patch))$/.test(relative)) throw new Error('Artifact is outside the downloadable evidence allowlist');
+          if (!/^(?:report(?:-pr)?\.md|candidate\.patch|manifest\.json|events\.jsonl|(?:graph-manifest|run-config|acceptance-plan|acceptance-review)\.json|(?:reproduction|verification|candidates)\/.+\.(?:log|json|patch))$/.test(relative)) throw new Error('Artifact is outside the downloadable evidence allowlist');
           const content = await fs.readFile(await sourcePath(store.dir(id), relative));
           res.writeHead(200, { 'content-type': 'text/plain; charset=utf-8', 'content-disposition': `attachment; filename="${path.basename(relative)}"`, 'cache-control': 'no-store' }); return res.end(content);
         }
         if (action === 'events' && req.method === 'GET') {
           res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive', 'x-accel-buffering': 'no' });
           let last = Number(req.headers['last-event-id'] || url.searchParams.get('after') || 0); if (!Number.isSafeInteger(last) || last < 0) last = 0;
-          let replaying = true; const queued: RunEvent[] = [];
-          const send = (event: RunEvent) => { if (event.seq <= last) return; last = event.seq; res.write(`id: ${event.seq}\ndata: ${JSON.stringify(event)}\n\n`); if (res.writableLength > 2_000_000) res.destroy(); };
-          const listener = (event: RunEvent) => { if (replaying) queued.push(event); else send(event); };
+          const replayAbort=new AbortController();
+          let replaying = true, closed = false; const queued: RunEvent[] = [];
+          let ping: ReturnType<typeof setInterval> | undefined;
+          const cleanup = () => { if (closed) return; closed = true; replayAbort.abort(); if (ping) clearInterval(ping); store.off(id, listener); queued.length = 0; };
+          const send = (event: RunEvent) => {
+            if (closed || res.destroyed || res.writableEnded || event.seq <= last) return;
+            last = event.seq; res.write(`id: ${event.seq}\ndata: ${JSON.stringify(event)}\n\n`);
+            if (res.writableLength > 2_000_000) { cleanup(); res.destroy(); }
+          };
+          const listener = (event: RunEvent) => { if (closed) return; if (replaying) {queued.push(event);if(queued.length>2000){cleanup();res.destroy();}} else send(event); };
+          req.once('close', cleanup); res.once('close', cleanup); res.once('error', cleanup);
           store.on(id, listener);
-          for (const event of await store.events(id, last)) send(event); replaying = false; for (const event of queued) send(event);
-          const ping = setInterval(() => res.write(': heartbeat\n\n'), 15000);
-          req.on('close', () => { clearInterval(ping); store.off(id, listener); }); return;
+          try {
+            for await (const event of store.streamEvents(id,last,replayAbort.signal)) send(event);
+            if (closed || res.destroyed || res.writableEnded) { cleanup(); return; }
+            replaying = false; for (const event of queued) send(event); queued.length = 0;
+            ping = setInterval(() => { if (closed || res.destroyed || res.writableEnded) cleanup(); else res.write(': heartbeat\n\n'); }, 15000);
+          } catch (error) { cleanup(); throw error; }
+          return;
         }
       }
       const assets: Record<string, [string, string]> = { '/': ['index.html', 'text/html'], '/app.js': ['app.js', 'text/javascript'], '/style.css': ['style.css', 'text/css'] };
@@ -154,6 +196,7 @@ export async function createServer(config: Config, options: { recover?: boolean;
       }
       return json(res, { error: 'Not found' }, 404);
     } catch (error) {
+      if (res.destroyed || res.writableEnded) return;
       if (!res.headersSent) json(res, { error: error instanceof Error ? error.message : String(error) }, 400); else res.end();
     }
   });

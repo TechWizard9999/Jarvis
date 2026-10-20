@@ -3,16 +3,21 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "engines": { "node": ">=24.0.0" },
+  "engines": {
+    "node": ">=24.0.0"
+  },
   "scripts": {
     "start": "node src/cli.ts serve",
     "doctor": "node src/cli.ts doctor",
     "demo": "node src/cli.ts demo",
     "test": "node --test tests/*.test.ts",
-    "check": "tsc --noEmit"
+    "check": "tsc --noEmit",
+    "verify": "node scripts/verify.mjs",
+    "test:browser": "node scripts/activity-scroll-e2e.mjs && node scripts/monitoring-e2e.mjs"
   },
   "devDependencies": {
     "@types/node": "24.10.0",
+    "playwright": "1.62.1",
     "typescript": "5.9.3"
   }
 }

@@ -7,6 +7,7 @@ export interface RepositoryProfile {
   focusedTestPrefix: string[]; fastCheckIds: string[]; checks: Record<string, string[]>;
   // Upstream tests that cannot run against the read-only source mount, each with a recorded reason; reported, never silent.
   skipTests?: Record<string, string>;
+  skipTestOwners?: Record<string, string[]>;
 }
 const rustPath = /^[A-Za-z_][A-Za-z0-9_]*(?:::[A-Za-z_][A-Za-z0-9_]*)*$/;
 // Appends `--skip NAME` filters (full test paths) to a `cargo test` argv, adding the `--` separator when absent.
@@ -31,6 +32,7 @@ export function loadProfile(file = defaultProfilePath): RepositoryProfile {
   if (!p.fastCheckIds?.every(id => !!p.checks[id])) throw new Error('Fast checks must reference configured check IDs');
   const skips = Object.entries(p.skipTests || {});
   if (!skips.every(([name, reason]) => rustPath.test(name) && name.includes('::') && typeof reason === 'string' && reason.trim().length >= 10)) throw new Error('skipTests entries must be qualified Rust test paths with a written reason');
+  for (const [name, owners] of Object.entries(p.skipTestOwners || {})) { if (!p.skipTests?.[name] || !Array.isArray(owners) || !owners.length) throw new Error('Skipped test owners must reference a declared skip'); owners.forEach(safeRelative); }
   p.checks = Object.fromEntries(Object.entries(p.checks).map(([id, argv]) => [id, withSkips(argv, skips.map(([name]) => name))]));
   return p;
 }

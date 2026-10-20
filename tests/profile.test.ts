@@ -25,7 +25,7 @@ test('skipTests adds explicit --skip filters to cargo test commands only and req
   const { root } = await tempConfig(); t.after(() => fs.rm(root, { recursive: true, force: true }));
   const file = path.join(root, 'skips.json');
   const checks = { lint: ['cargo', 'clippy', '--locked'], unit: ['cargo', 'test', '--locked'], args: ['cargo', 'test', '--', '--test-threads=1'] };
-  await fs.writeFile(file, JSON.stringify({ ...defaultProfile, fastCheckIds: ['lint'], checks, skipTests: { 'hooks::tests::writes_to_source': 'Writes into the read-only source mount' } }));
+  await fs.writeFile(file, JSON.stringify({ ...defaultProfile, fastCheckIds: ['lint'], checks, skipTests: { 'hooks::tests::writes_to_source': 'Writes into the read-only source mount' }, skipTestOwners: { 'hooks::tests::writes_to_source': ['src/hooks.rs'] } }));
   const profile = loadProfile(file);
   assert.deepEqual(profile.checks.lint, checks.lint);
   assert.deepEqual(profile.checks.unit, ['cargo', 'test', '--locked', '--', '--skip', 'hooks::tests::writes_to_source']);

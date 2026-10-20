@@ -75,5 +75,8 @@
   },
   "skipTests": {
     "hooks::init::pi::tests::test_global_uninstall_detects_shared_pi_omp_extension": "Creates a relative .omp directory in the crate root (fs::create_dir_all(OMP_LOCAL_DIR) in src/hooks/init/pi.rs), which the read-only source mount forbids; it passes in upstream CI, where the checkout is writable."
+  },
+  "skipTestOwners": {
+    "hooks::init::pi::tests::test_global_uninstall_detects_shared_pi_omp_extension": ["src/hooks/init/pi.rs"]
   }
 }

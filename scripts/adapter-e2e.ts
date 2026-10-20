@@ -12,15 +12,34 @@ import { original } from '../tests/helpers.ts';
 const root=path.join(process.cwd(),'state','adapter-integration',randomBytes(5).toString('hex'));
 const config=loadConfig({...process.env,BUGFIX_PROJECT_DIR:process.cwd(),BUGFIX_STATE_DIR:root,BUGFIX_REPO_ROOT:path.join(root,'repos'),BUGFIX_MODEL:'custom-nvidia/bugfix-adapter-fixture',BUGFIX_BIND:'0.0.0.0',BUGFIX_NVIDIA_SECRET:path.join(root,'fixture-provider-key')});
 await fs.mkdir(root,{recursive:true});await fs.writeFile(config.nvidiaSecret,'fixture-not-a-real-nvidia-key');
-let requests=0;
+let requests=0, activeCase='discovery';
+const observed: {case:string;phase:string;tools:string[];schemaArrayOnly?:boolean}[]=[];
 const fakeProvider: typeof fetch = async (_url,init)=>{
   requests++;const body=JSON.parse(String(init?.body));const names=(body.tools||[]).map((t:any)=>t.function.name);
   assert.ok(names.every((name:string)=>name.startsWith('bugfix_')),'Native tool leaked into outbound payload');
-  const hasResult=body.messages.some((m:any)=>m.role==='tool');
+  const system=body.messages.filter((message:any)=>message.role==='system').map((message:any)=>typeof message.content==='string'?message.content:JSON.stringify(message.content)).join('\n');
+  const phase=/Current phase: (discovery|review|reproduction|patching|format|locked)/.exec(system)?.[1];
+  if(phase){
+    const readOnly=phase==='review'||phase==='discovery',replyOnly=phase==='format'||phase==='locked';
+    assert.deepEqual([...names].sort(),replyOnly?[]:readOnly?['bugfix_read_source','bugfix_search_text']:['bugfix_apply_patch','bugfix_read_source','bugfix_replace_source','bugfix_run_check','bugfix_search_text']);
+    if(readOnly)assert.doesNotMatch(system,/Add multiple|Run the trusted|confirm the intended assertion failure|Allowed editable roots|Allowed run_check IDs/);
+    if(replyOnly)assert.doesNotMatch(system,/intended assertion|Allowed editable roots|Allowed run_check IDs|format-source/);
+    const apply=(body.tools||[]).find((tool:any)=>tool.function.name==='bugfix_apply_patch');
+    if(apply){
+      assert.equal(apply.function.parameters.properties.edits.type,'array','OpenCode changed the edits schema');
+      assert.ok(apply.function.parameters.required.includes('edits'));
+      assert.doesNotMatch(JSON.stringify(apply.function.parameters.properties.edits),/"(?:anyOf|oneOf)"/);
+    }
+    observed.push({case:activeCase,phase,tools:names,schemaArrayOnly:apply?true:undefined});
+  }
+  const lastUser=body.messages.findLastIndex((message:any)=>message.role==='user');
+  const hasResult=body.messages.some((message:any,index:number)=>index>lastUser&&message.role==='tool');
   const canRead=names.includes('bugfix_read_source');
-  const delta=canRead && !hasResult ? {role:'assistant',tool_calls:[{index:0,id:'call_read_source',type:'function',function:{name:'bugfix_read_source',arguments:JSON.stringify({path:'src/lib.rs'})}}]} : {role:'assistant',content:canRead?JSON.stringify({adapter:'ok',evidenceRead:true}):'Adapter integration'};
+  const formatProse=activeCase==='format-retry'&&phase==='reproduction';
+  const wantsRead=!!phase&&canRead&&!hasResult&&!formatProse;
+  const delta=wantsRead?{role:'assistant',tool_calls:[{index:0,id:'call_read_source_'+requests,type:'function',function:{name:'bugfix_read_source',arguments:JSON.stringify({path:'src/lib.rs'})}}]}:{role:'assistant',content:phase?formatProse?'Prose requires a JSON-only retry.':JSON.stringify({adapter:'ok',phase,evidenceRead:canRead}):'Adapter integration'};
   const completion={id:'fixture-'+requests,object:'chat.completion.chunk',created:1,model:body.model,choices:[{index:0,delta,finish_reason:null}]};
-  const finish={...completion,choices:[{index:0,delta:{},finish_reason:canRead&&!hasResult?'tool_calls':'stop'}],usage:{prompt_tokens:30,completion_tokens:20,total_tokens:50}};
+  const finish={...completion,choices:[{index:0,delta:{},finish_reason:wantsRead?'tool_calls':'stop'}],usage:{prompt_tokens:30,completion_tokens:20,total_tokens:50}};
   return new Response(`data: ${JSON.stringify(completion)}\n\ndata: ${JSON.stringify(finish)}\n\ndata: [DONE]\n\n`,{status:200,headers:{'content-type':'text/event-stream'}});
 };
 const app=await createServer(config,{recover:false,providerRequest:fakeProvider});
@@ -34,12 +53,23 @@ app.pipeline.contexts.set(run.id,{run,abort,agent,source,base:source,phase:'disc
 try{
   const exists=await app.pipeline.docker.command(['network','inspect',config.dockerNetwork]);if(exists.code)await app.pipeline.docker.command(['network','create',config.dockerNetwork]);
   await agent.start(abort.signal);
-  const answer=await agent.ask('ADAPTER_INTEGRATION: Use bugfix_read_source to read src/lib.rs, then return only {"adapter":"ok","evidenceRead":true}.',AbortSignal.timeout(90000));
-  assert.equal(answer.adapter,'ok');assert.equal(answer.evidenceRead,true);
+  for(const phase of ['discovery','review','reproduction','patching'] as const){
+    activeCase=phase;app.pipeline.contexts.get(run.id)!.phase=phase;
+    const answer=await agent.ask(`ADAPTER_INTEGRATION ${phase}: Use bugfix_read_source to read src/lib.rs, then Return exactly {"adapter":"ok","phase":"${phase}","evidenceRead":true}.`,AbortSignal.timeout(90000),answer=>answer.adapter==='ok'&&answer.phase===phase,phase);
+    assert.equal(answer.evidenceRead,true);assert.ok(observed.some(record=>record.case===phase&&record.phase===phase));
+  }
+  activeCase='format-retry';app.pipeline.contexts.get(run.id)!.phase='reproduction';
+  const answer=await agent.ask('ADAPTER_INTEGRATION format retry: Return exactly {"adapter":"ok","phase":"format","evidenceRead":false}.',AbortSignal.timeout(90000),answer=>answer.adapter==='ok'&&answer.phase==='format','reproduction');
+  assert.equal(answer.evidenceRead,false);assert.ok(observed.some(record=>record.case==='format-retry'&&record.phase==='format'&&record.tools.length===0));
+  app.pipeline.contexts.get(run.id)!.phase='review';
+  await assert.rejects(app.pipeline.tool(run.id,'run_check',{check:'format-source'}),/Checks are disabled/);
+  await assert.rejects(app.pipeline.tool(run.id,'replace_source',{path:'src/lib.rs',before:original,after:'must not write'}),/Edits are unavailable/);
+  assert.equal(await fs.readFile(path.join(source,'src/lib.rs'),'utf8'),original);
   const events=await app.store.events(run.id);assert.ok(events.some(e=>e.kind==='result'&&(e.data as any)?.tool==='read_source'));
   assert.ok(events.some(e=>e.kind==='model_request'));
-  await atomicJson(path.join(process.cwd(),'state','adapter-results.json'),{testedAt:new Date().toISOString(),outcome:'passed',provider:'local scripted SSE (no NVIDIA calls)',opencodeImage:await app.pipeline.docker.imageId(config.agentImage),requests,toolReadExecuted:true});
-  console.log('PASS: real OpenCode server, generated config, custom tool call, controller bridge, outbound allowlist, streamed completion and final JSON.');
+  assert.equal(events.filter(event=>event.kind==='format_retry').length,1);
+  await atomicJson(path.join(process.cwd(),'state','adapter-results.json'),{testedAt:new Date().toISOString(),outcome:'passed',provider:'local scripted SSE (no NVIDIA calls)',opencodeImage:await app.pipeline.docker.imageId(config.agentImage),requests,toolReadExecuted:true,phaseContracts:observed,backendReviewGuards:true});
+  console.log('PASS: real OpenCode phase-specific system/tools, array-only outbound patch schema, read bridge, disabled format-only retry, backend review guards and final JSON.');
 }finally{
   await agent.stop();await app.pipeline.docker.cleanup(run);app.pipeline.contexts.delete(run.id);app.server.closeAllConnections();await new Promise<void>(resolve=>app.server.close(()=>resolve()));
 }

@@ -1,0 +1,16 @@
+{
+  "source": "Saved gh pr view 4682 --repo rtk-ai/rtk --json headRefOid,statusCheckRollup from the original PR inspection",
+  "headRefOid": "5fc0f5489cb4493e57de1456b6de7bc67d4ea5d0",
+  "statusCheckRollup": [
+    {
+      "__typename": "CheckRun",
+      "completedAt": "2026-10-20T10:31:03Z",
+      "conclusion": "SKIPPED",
+      "detailsUrl": "https://github.com/rtk-ai/rtk/actions/runs/39408494770/job/118580175662",
+      "name": "check-target",
+      "startedAt": "2026-10-20T10:31:04Z",
+      "status": "COMPLETED",
+      "workflowName": "PR Target Branch Check"
+    }
+  ]
+}

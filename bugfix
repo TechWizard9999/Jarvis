@@ -30,6 +30,6 @@ case "$command" in
     # A run pauses while the Mac sleeps; keep it awake (idle sleep, and system sleep on AC power) until the run reports its outcome.
     if command -v caffeinate >/dev/null 2>&1; then exec caffeinate -i -s docker compose exec -T controller node src/cli.ts fix "$@"; fi
     exec docker compose exec -T controller node src/cli.ts fix "$@" ;;
-  doctor|run|list|tail|cancel|publish|demo) exec docker compose exec -T controller node src/cli.ts "$command" "$@" ;;
-  *) printf '%s\n' 'RTK Bugfix Agent' './bugfix setup [--install-docker] [--clone]' './bugfix build' './bugfix up' './bugfix doctor' './bugfix fix https://github.com/rtk-ai/rtk/issues/NUMBER    (RCA + verified patch + draft PR link)' './bugfix run --repo /absolute/path/to/rtk --issue https://github.com/rtk-ai/rtk/issues/NUMBER --publish' './bugfix demo | list | tail ID | cancel ID | publish ID | down | logs' ;;
+  doctor|run|list|tail|cancel|publish|inspect-pr|note|demo) exec docker compose exec -T controller node src/cli.ts "$command" "$@" ;;
+  *) printf '%s\n' 'RTK Bugfix Agent' './bugfix setup [--install-docker] [--clone]' './bugfix build' './bugfix up' './bugfix doctor' './bugfix fix https://github.com/rtk-ai/rtk/issues/NUMBER    (RCA + verified patch + draft PR link)' './bugfix run --repo /absolute/path/to/rtk --issue https://github.com/rtk-ai/rtk/issues/NUMBER --publish' './bugfix note ID --kind guidance|manual_fix|harness_fix|review --message TEXT' './bugfix demo | list | tail ID | cancel ID | publish ID | down | logs' ;;
 esac

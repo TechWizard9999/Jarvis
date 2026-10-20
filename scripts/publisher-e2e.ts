@@ -19,7 +19,7 @@ checked(await exec('git', ['init', '--bare', remote]), 'Create local publication
 await fs.copyFile(path.join(evidence, 'verified.bundle'), path.join(artifacts, 'verified.bundle'));
 await fs.writeFile(path.join(artifacts, 'report-pr.md'), 'Scripted publisher integration fixture. No real GitHub PR.\n');
 const sameRepository = process.env.BUGFIX_PUBLISHER_CASE === 'same';
-const input = { runId: manifest.id, upstream: 'example/another', fork: sameRepository ? 'example/another' : 'test-user/another', branch: manifest.branch, commit: manifest.verifiedCommit, tree: manifest.verifiedTree, issue: 42, base: 'main' };
+const input = { runId: manifest.id, upstream: 'example/another', fork: sameRepository ? 'example/another' : 'test-user/another', branch: manifest.branch, commit: manifest.verifiedCommit, tree: manifest.verifiedTree, issue: 42, base: 'main', title: 'fix: preserve fixture error lines' };
 await atomicJson(path.join(artifacts, 'publication-input.json'), input);
 await fs.writeFile(path.join(root, 'fixture-token'), 'fixture-not-a-real-github-token', { mode: 0o600 });
 // This executable can only exist in the explicitly mounted test bin; production has the real gh.
@@ -36,6 +36,7 @@ if(a[0]==='api'){
   else process.exit(2);
 }else if(a[0]==='pr'&&a[1]==='create'){
   const value=n=>a[a.indexOf(n)+1];
+  if(value('--title')!==input.title)throw Error('Issue-specific title was ignored');
   if(value('--repo')!==input.upstream||value('--base')!==input.base||!a.includes('--draft'))throw Error('Profile was ignored');
   const expectedHead=input.fork.toLowerCase()===input.upstream.toLowerCase()?input.branch:input.fork.split('/')[0]+':'+input.branch;
   if(value('--head')!==expectedHead)throw Error('Incorrect PR head identity');
@@ -54,6 +55,12 @@ async function publish() {
     '--env', 'GIT_CONFIG_KEY_0=url.file:///remote/.insteadOf', '--env', `GIT_CONFIG_VALUE_0=https://github.com/${input.fork}.git`,
     '--env', 'GIT_CONFIG_KEY_1=safe.directory', '--env', 'GIT_CONFIG_VALUE_1=/remote', config.publisherImage], { timeoutMs: 120000 });
 }
+// Mutate fixture state inside the VM, matching the production controller's filesystem namespace.
+// Host atomic renames of existing 9p-shared files can otherwise expose stale/incomplete mock state.
+async function fixtureState(operation: string, name: string, value?: unknown) {
+  const script = 'const fs=require("node:fs");const [op,name,value]=process.argv.slice(1);const p="/artifacts/"+name;if(op==="remove")fs.rmSync(p,{force:true});else fs.writeFileSync(p,value);';
+  checked(await exec(config.docker, ['run','--rm','--network','none','--entrypoint','node','--mount',`type=bind,source=${artifacts},target=/artifacts`,config.publisherImage,'-e',script,operation,name,typeof value==='string'?value:JSON.stringify(value)]), 'Update publication fixture state');
+}
 const happy = await publish(); assert.equal(happy.code, 0, happy.stderr);
 const created = JSON.parse(await fs.readFile(path.join(artifacts, 'publication-result.json'), 'utf8'));
 assert.equal(created.commit, input.commit); assert.equal(created.draft, true); assert.equal(created.reused, undefined);
@@ -69,10 +76,10 @@ if (sameRepository) {
 const body = await fs.readFile(path.join(artifacts, 'mock-body.md'), 'utf8');
 assert.match(body, /Other open PRs reference this issue: https:\/\/github\.com\/example\/another\/pull\/99\./); assert.doesNotMatch(body, /pull\/77/);
 // Reset only the mock API fixtures to exercise a separate uncertain-creation scenario.
-await fs.rm(path.join(artifacts, 'mock-pr.json'));
-await fs.rm(path.join(artifacts, 'mock-create-count'));
+await fixtureState('remove','mock-pr.json');
+await fixtureState('remove','mock-create-count');
 await sleep(1000); // Let the host-to-VM bind mount observe removals before the next container starts.
-await fs.writeFile(path.join(artifacts, 'mock-timeout'), 'simulate uncertain outcome');
+await fixtureState('write','mock-timeout','simulate uncertain outcome');
 const first = await publish(); assert.equal(first.code, 1, first.stderr);
 assert.match(JSON.parse(await fs.readFile(path.join(artifacts, 'publication-result.json'), 'utf8')).error, /Simulated network timeout/);
 const pushed = checked(await exec('git', ['--git-dir', remote, 'rev-parse', `refs/heads/${input.branch}`]), 'Inspect real local pushed branch');
@@ -82,11 +89,11 @@ const reconciled = JSON.parse(await fs.readFile(path.join(artifacts, 'publicatio
 assert.equal(reconciled.reused, true); assert.equal(reconciled.commit, input.commit);
 assert.equal(await fs.readFile(path.join(artifacts, 'mock-create-count'), 'utf8'), '1', 'Duplicate PR creation');
 const prFile = path.join(artifacts, 'mock-pr.json'), pr = JSON.parse(await fs.readFile(prFile, 'utf8'));
-pr.head.sha = '0'.repeat(40); await atomicJson(prFile, pr);
+pr.head.sha = '0'.repeat(40); await fixtureState('write','mock-pr.json',pr);
 const mismatch = await publish(); assert.equal(mismatch.code, 1, mismatch.stderr);
 assert.match(JSON.parse(await fs.readFile(path.join(artifacts, 'publication-result.json'), 'utf8')).error, /different head/);
-await fs.rm(prFile);
-await atomicJson(path.join(artifacts, 'publication-input.json'), { ...input, tree: '0'.repeat(40) });
+await fixtureState('remove','mock-pr.json');
+await fixtureState('write','publication-input.json',{ ...input, tree: '0'.repeat(40) });
 const wrongBundle = await publish(); assert.equal(wrongBundle.code, 1, wrongBundle.stderr);
 assert.match(JSON.parse(await fs.readFile(path.join(artifacts, 'publication-result.json'), 'utf8')).error, /Bundle does not match/);
 assert.equal(await fs.readFile(path.join(artifacts, 'mock-create-count'), 'utf8'), '1', 'Unverified bundle reached PR creation');

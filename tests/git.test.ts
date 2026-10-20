@@ -31,3 +31,23 @@ test('source-only changes export correctly when the repository has no tests dire
   const source=path.join(store.dir(run.id),'source');await git.preflight(run,source);await fs.writeFile(path.join(source,'src/lib.rs'),withRegression);
   assert.match(await git.diff(run,source),/bugfix_issue_1/);
 });
+test('inherited Git overrides cannot redirect the repository or replace the recorded commit identity', async t => {
+  const {root,config}=await tempConfig();t.after(()=>fs.rm(root,{recursive:true,force:true}));const repo=await fixtureRepo(config.repoRoot),store=new Store(config.stateDir),git=new Repository(config);
+  const run=await store.create({repo,issue:'https://github.com/rtk-ai/rtk/issues/1',mode:'evaluation'});run.issue={number:1,url:run.input.issue,title:'fixture',body:'fixture'};
+  const source=path.join(store.dir(run.id),'source'); await git.preflight(run,source); await fs.writeFile(path.join(source,'src/lib.rs'),withRegression);
+  (run as any).publicationIdentity = { fork:'personal/rtk',upstream:'rtk-ai/rtk',base:'develop',branch:run.branch,author:{name:'Recorded Author',email:'recorded@example.invalid'},committer:{name:'Recorded Committer',email:'committer@example.invalid'} };
+  const overrides = { GIT_DIR: '/missing/repository', GIT_WORK_TREE: '/missing/tree', GIT_INDEX_FILE: path.join(root, 'wrong-index'), GIT_AUTHOR_NAME: 'Injected', GIT_AUTHOR_EMAIL: 'injected@example.invalid', GIT_COMMITTER_NAME: 'Injected', GIT_COMMITTER_EMAIL: 'injected@example.invalid', GIT_CONFIG_COUNT:'1', GIT_CONFIG_KEY_0:'user.email', GIT_CONFIG_VALUE_0:'other@example.invalid' };
+  const originalEnv = Object.fromEntries(Object.keys(overrides).map(key => [key, process.env[key]])); Object.assign(process.env, overrides);
+  t.after(() => { for (const [key,value] of Object.entries(originalEnv)) if (value === undefined) delete process.env[key]; else process.env[key]=value; });
+  run.verifiedTree=await git.tree(run,source); const bundle=path.join(store.dir(run.id),'verified.bundle'); await git.commit(run,source,bundle);
+  const metadata=await git.git(run.worktree!,['show','-s','--format=%an%n%ae%n%cn%n%ce%n%P%n%B','HEAD']);
+  assert.deepEqual(metadata.stdout.split('\n').slice(0,4),['Recorded Author','recorded@example.invalid','Recorded Committer','committer@example.invalid']);
+  assert.equal(metadata.stdout.split('\n')[4],run.baseSha); assert.match(metadata.stdout,/Signed-off-by: Recorded Author <recorded@example.invalid>/);
+  assert.equal((run as any).commitProvenance.tree,run.verifiedTree); assert.deepEqual((run as any).commitProvenance.parents,[run.baseSha]);
+});
+test('cancelled preflight performs no Git command and creates no worktree', async t => {
+  const {root,config}=await tempConfig();t.after(()=>fs.rm(root,{recursive:true,force:true}));const repo=await fixtureRepo(config.repoRoot),store=new Store(config.stateDir),git=new Repository(config);
+  const run=await store.create({repo,issue:'https://github.com/rtk-ai/rtk/issues/1',mode:'evaluation'});run.issue={number:1,url:run.input.issue,title:'fixture',body:'fixture'};
+  const abort=new AbortController();abort.abort(new Error('cancel preflight'));const source=path.join(store.dir(run.id),'source');
+  await assert.rejects((git.preflight as any)(run,source,abort.signal),/cancel preflight/);assert.equal(run.worktree,undefined);await assert.rejects(fs.stat(source),{code:'ENOENT'});
+});

@@ -25,3 +25,16 @@ test('rejects a regression which already existed and duplicate tests', () => {
   assert.throws(() => assertOnlyNewRegression(withRegression, withRegression, testName), /newly added/);
   assert.throws(() => extractTest(withRegression + '\n' + withRegression, testName), /Exactly one/);
 });
+
+test('inventories async and parameterized macro tests with their full attributes', () => {
+  const code = '#[tokio::test(flavor = "current_thread")] async fn asynchronous() { assert!(true); }\n#[test_case(1; "one")] fn parameterized(value: i32) { assert_eq!(value, 1); }';
+  assert.deepEqual(rustTests(code).map(t => t.qualified), ['asynchronous', 'parameterized']);
+  assert.ok(rustTests(code)[0].attributes.includes('tokio'));
+});
+
+test('file attributes and nontrivial test module gating remain in frozen context', () => {
+  const code = '#![cfg(unix)]\n' + withRegression.replace('#[cfg(test)]', '#[cfg(all(test, unix))]');
+  const frozen = freezeRust(code, testName);
+  assert.notEqual(freezeRust(code.replace('#![cfg(unix)]', '#![cfg(windows)]'), testName).contextHash, frozen.contextHash);
+  assert.notEqual(freezeRust(code.replace('use super::*;', 'use super::*; fn expected() -> bool { false }'), testName).contextHash, frozen.contextHash);
+});
