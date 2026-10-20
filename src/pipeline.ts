@@ -44,7 +44,13 @@ export class Pipeline {
     this.agentFactory = run => new Agent(config, this.docker, store, run);
     this.issueLoader = async run => {
       const number = Number(new URL(run.input.issue).pathname.split('/').filter(Boolean).at(-1));
-      const response = await fetch(`https://api.github.com/repos/${(run.profile || this.config.profile).upstream}/issues/${number}`, { headers: { accept: 'application/vnd.github+json', 'user-agent': 'bugfix-agent/0.1' }, signal: AbortSignal.timeout(30000) });
+      const secret = await fs.readFile(this.config.githubSecret, 'utf8').catch((error: NodeJS.ErrnoException) => {
+        if (error.code === 'ENOENT') return '';
+        throw error;
+      });
+      const token = secret.trim();
+      if (token && /\s/.test(token)) throw new Error('GitHub secret file is invalid');
+      const response = await fetch(`https://api.github.com/repos/${(run.profile || this.config.profile).upstream}/issues/${number}`, { headers: { accept: 'application/vnd.github+json', 'user-agent': 'bugfix-agent/0.1', ...(token ? { authorization: `Bearer ${token}` } : {}) }, signal: AbortSignal.timeout(30000) });
       if (!response.ok) throw new Error(`GitHub issue fetch: HTTP ${response.status}; check network/API rate limits`);
       const issue = await response.json() as any;
       if (issue.pull_request) throw new Error('Input must be an issue, not a pull request');
@@ -365,7 +371,7 @@ export class Pipeline {
         if (!argv) throw new Error('Unknown approved check');
         const check = await this.check(context, run.workerContainer!, `tool-${run.tools}-${args.check}`, argv); const checked: typeof check & { note?: string } = { ...check, output: check.output.slice(-24000) }; result = checked;
         // A filter that matches nothing exits 0; say so, or the model reads it as a pass.
-        if (args.check.startsWith('test-') && !check.exitCode && /test result: ok\. 0 passed; 0 failed;/.test(check.output) && !/test result: ok\. [1-9]/.test(check.output)) checked.note = `No library unit test matched "${args.test}". Focused/module checks run only inline #[cfg(test)] tests under ${profile.sourceRoots.join(', ')} (cargo test --lib), named by crate path as cargo prints it, e.g. hooks::hook_cmd::tests::name. Integration tests in ${profile.testRoots.join(', ')}/*.rs cannot be run or used as the regression.`;
+        if (args.check.startsWith('test-') && !check.exitCode && /test result: ok\. 0 passed; 0 failed;/.test(check.output) && !/test result: ok\. [1-9]/.test(check.output)) checked.note = `No inline unit test matched "${args.test}". Focused/module checks use ${profile.focusedTestPrefix.join(' ')} with a crate-qualified test name under ${profile.sourceRoots.join(', ')}. Integration tests in ${profile.testRoots.join(', ')}/*.rs cannot be used as the regression.`;
       } else throw new Error('Unknown controller tool');
       const event = await this.store.event(run, 'tool', 'result', name, { tool: name, call: called.seq, result });
       return { evidenceId: event.seq, result };

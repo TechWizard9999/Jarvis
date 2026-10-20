@@ -39,6 +39,7 @@ services:
       - "${BUGFIX_REPO_ROOT}:${BUGFIX_REPO_ROOT}"
       - "${BUGFIX_STATE_DIR}:${BUGFIX_STATE_DIR}"
       - "${BUGFIX_PROJECT_DIR}/.secrets/nvidia_api_key:${BUGFIX_PROJECT_DIR}/.secrets/nvidia_api_key:ro"
+      - "${BUGFIX_PROJECT_DIR}/.secrets/github_token:${BUGFIX_PROJECT_DIR}/.secrets/github_token:ro"
     networks: [control]
     healthcheck:
       test: ["CMD", "node", "-e", "require('http').get('http://127.0.0.1:3210/',r=>process.exit(r.statusCode===401?0:1)).on('error',()=>process.exit(1))"]

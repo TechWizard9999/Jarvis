@@ -16,6 +16,9 @@ test('worktree preserves original checkout, hides Git metadata from source and e
   const diff=await git.diff(run,source);assert.match(diff,/tests\/fixtures\/new.txt/);assert.match(diff,/bugfix_issue_1/);
   assert.equal(await fs.readFile(path.join(repo,'src/lib.rs'),'utf8'),original);
   run.verifiedTree=await git.tree(run,source);await git.commit(run,source,path.join(store.dir(run.id),'verified.bundle'));assert.ok(run.verifiedCommit);
+  const commit = await git.git(run.worktree!, ['log', '-1', '--format=%B']);
+  assert.equal(commit.code, 0);
+  assert.match(commit.stdout, /Signed-off-by: Test Author <test@example\.invalid>/);
 });
 test('dirty trees are rejected before creating a worktree', async t => {
   const {root,config}=await tempConfig();t.after(()=>fs.rm(root,{recursive:true,force:true}));const repo=await fixtureRepo(config.repoRoot);

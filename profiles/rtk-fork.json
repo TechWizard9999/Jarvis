@@ -1,0 +1,23 @@
+{
+  "id": "rtk-fork",
+  "adapter": "cargo-rust",
+  "upstream": "TechWizard9999/rtk",
+  "baseBranch": "develop",
+  "packageName": "rtk",
+  "manifest": "Cargo.toml",
+  "sourceRoots": ["src"],
+  "testRoots": ["tests"],
+  "fixtureRoot": "tests/fixtures",
+  "maxChangedFiles": 8,
+  "maxSourceFiles": 3,
+  "focusedTestPrefix": ["cargo", "test", "--bin", "rtk", "--locked", "--offline"],
+  "fastCheckIds": ["fmt", "clippy-default"],
+  "checks": {
+    "fmt": ["cargo", "fmt", "--all", "--", "--check"],
+    "clippy-default": ["cargo", "clippy", "--workspace", "--all-targets", "--locked", "--offline"],
+    "test-workspace": ["cargo", "test", "--workspace", "--locked", "--offline"],
+    "clippy-oss": ["cargo", "clippy", "--no-default-features", "--all-targets", "--locked", "--offline"],
+    "test-oss": ["cargo", "test", "--no-default-features", "--locked", "--offline"],
+    "docs": ["cargo", "doc", "--no-deps", "--locked", "--offline"]
+  }
+}

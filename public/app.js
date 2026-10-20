@@ -2,13 +2,25 @@ const $ = selector => document.querySelector(selector);
 let selected, stream, tab = 'activity', events = [], config, refreshTimer;
 // The activity log is built incrementally and kept across re-renders: rebuilding it per event froze the page on
 // runs with thousands of events. Streamed model fragments and consecutive command output merge into one row.
-let logNode, lastRow, pending = [], frame, rowCount = 0;
+let logNode, lastRow, pending = [], frame, rowCount = 0, logFollow = true, logScrollTop = 0;
 const MAX_ROWS = 1500;
 const mergeable = (a, b) => a && a.source === b.source && a.kind === b.kind && ((b.source === 'opencode' && ['message', 'provider_reasoning'].includes(b.kind)) || (b.source === 'docker' && b.kind === 'output'));
-function resetLog() { logNode = element('div', undefined, 'log'); lastRow = undefined; pending = []; rowCount = 0; if (frame) cancelAnimationFrame(frame); frame = undefined; }
+const logAtEnd = () => logNode.scrollHeight - logNode.scrollTop - logNode.clientHeight < 40;
+function rememberLogPosition() { if (logNode?.isConnected) { logFollow = logAtEnd(); logScrollTop = logNode.scrollTop; } }
+function trimLog() { while (rowCount > MAX_ROWS && logNode.firstChild) { logNode.firstChild.remove(); rowCount--; } }
+function resetLog() {
+  logNode = element('div', undefined, 'log'); lastRow = undefined; pending = []; rowCount = 0; logFollow = true; logScrollTop = 0;
+  if (frame) cancelAnimationFrame(frame); frame = undefined;
+  logNode.addEventListener('scroll', () => {
+    if (!logNode.isConnected) return;
+    const wasFollowing = logFollow;
+    logFollow = logAtEnd(); logScrollTop = logNode.scrollTop;
+    if (logFollow && !wasFollowing) { trimLog(); logNode.scrollTop = logNode.scrollHeight; }
+  });
+}
 function flushLog() {
   frame = undefined; if (!logNode) return;
-  const atBottom = logNode.scrollHeight - logNode.scrollTop - logNode.clientHeight < 40;
+  rememberLogPosition();
   for (const event of pending) {
     // Fragments already carry their own line breaks; appendData avoids re-parsing the whole row each time.
     if (mergeable(lastRow?.event, event)) { lastRow.text.firstChild.appendData(event.message); lastRow.event = event; continue; }
@@ -17,8 +29,9 @@ function flushLog() {
     logNode.append(row); lastRow = { event, text }; rowCount++;
   }
   pending = [];
-  while (rowCount > MAX_ROWS && logNode.firstChild) { logNode.firstChild.remove(); rowCount--; }
-  if (atBottom) logNode.scrollTop = logNode.scrollHeight;
+  // Keep older rows in place while someone is reading them. Trim only after they resume following the stream.
+  if (logFollow) { trimLog(); if (logNode.isConnected) logNode.scrollTop = logNode.scrollHeight; }
+  if (logNode.isConnected) logScrollTop = logNode.scrollTop;
 }
 function queueLog(event) { pending.push(event); if (!frame) frame = requestAnimationFrame(flushLog); }
 const stages = ['preflight','environment','discovery','reproduction','patching','verification','publishing'];
@@ -50,6 +63,7 @@ async function choose(id) {
 }
 function render() {
   if (!selected) return;
+  rememberLogPosition();
   const run = selected, detail = $('#detail'); detail.replaceChildren();
   const head = element('div',undefined,'detail-head'), title = element('div');
   title.append(element('h2',run.demo ? 'Interface demonstration' : run.issue?.title || 'Preparing repair'),element('p',run.id)); head.append(title);
@@ -76,7 +90,8 @@ function render() {
 }
 function renderActivity() {
   const content = $('.tab-content'); if (!content || tab !== 'activity' || !logNode) return;
-  const top = logNode.scrollTop; content.replaceChildren(logNode); logNode.scrollTop = top;
+  content.replaceChildren(logNode);
+  logNode.scrollTop = logFollow ? logNode.scrollHeight : logScrollTop;
 }
 $('#run-form').onsubmit=async event=>{event.preventDefault();error('');$('#start').disabled=true;try{const run=await api('/api/runs',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({repo:$('#repo').value,issue:$('#issue').value,publish:$('#publish').checked,retrieval:'graph'})});await choose(run.id);}catch(e){error(e.message);}finally{$('#start').disabled=false;}};
 $('#demo').onclick=async()=>{try{const run=await api('/api/demo',{method:'POST'});await choose(run.id);}catch(e){error(e.message);}};
