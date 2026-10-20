@@ -10,10 +10,10 @@ import { atomicJson } from '../src/store.ts';
 import { original } from '../tests/helpers.ts';
 
 const root=path.join(process.cwd(),'state','adapter-integration',randomBytes(5).toString('hex'));
-const config=loadConfig({...process.env,BUGFIX_PROJECT_DIR:process.cwd(),BUGFIX_STATE_DIR:root,BUGFIX_REPO_ROOT:path.join(root,'repos'),BUGFIX_MODEL:'custom-nvidia/bugfix-adapter-fixture',BUGFIX_BIND:'0.0.0.0',BUGFIX_NVIDIA_SECRET:path.join(root,'fixture-provider-key')});
+const config=loadConfig({...process.env,BUGFIX_PROJECT_DIR:process.cwd(),BUGFIX_STATE_DIR:root,BUGFIX_REPO_ROOT:path.join(root,'repos'),BUGFIX_MODEL:'nim/nvidia/nemotron-3-ultra-550b-a55b',BUGFIX_BIND:'0.0.0.0',BUGFIX_NVIDIA_SECRET:path.join(root,'fixture-provider-key')});
 await fs.mkdir(root,{recursive:true});await fs.writeFile(config.nvidiaSecret,'fixture-not-a-real-nvidia-key');
 let requests=0, activeCase='discovery';
-const observed: {case:string;phase:string;tools:string[];schemaArrayOnly?:boolean}[]=[];
+const observed: {case:string;phase:string;tools:string[];schemaArrayOnly?:boolean;maxTokens:number;reasoningBudget?:number;reasoningEffort?:string;thinking:boolean}[]=[];
 const fakeProvider: typeof fetch = async (_url,init)=>{
   requests++;const body=JSON.parse(String(init?.body));const names=(body.tools||[]).map((t:any)=>t.function.name);
   assert.ok(names.every((name:string)=>name.startsWith('bugfix_')),'Native tool leaked into outbound payload');
@@ -30,7 +30,17 @@ const fakeProvider: typeof fetch = async (_url,init)=>{
       assert.ok(apply.function.parameters.required.includes('edits'));
       assert.doesNotMatch(JSON.stringify(apply.function.parameters.properties.edits),/"(?:anyOf|oneOf)"/);
     }
-    observed.push({case:activeCase,phase,tools:names,schemaArrayOnly:apply?true:undefined});
+    const expected=phase==='format'||phase==='locked'
+      ? {output:2048,thinking:false,budget:undefined,effort:'none'}
+      : phase==='discovery'
+        ? {output:8192,thinking:true,budget:4096,effort:'medium'}
+        : {output:24576,thinking:true,budget:16384,effort:'high'};
+    assert.equal(body.model,'nvidia/nemotron-3-ultra-550b-a55b');
+    assert.equal(body.max_tokens,expected.output,'Actual OpenCode request must use the trusted phase output cap');
+    assert.equal(body.chat_template_kwargs?.enable_thinking,expected.thinking);
+    assert.equal(body.reasoning_budget,expected.budget);
+    assert.equal(body.reasoning_effort,expected.effort);
+    observed.push({case:activeCase,phase,tools:names,schemaArrayOnly:apply?true:undefined,maxTokens:body.max_tokens,reasoningBudget:body.reasoning_budget,reasoningEffort:body.reasoning_effort,thinking:body.chat_template_kwargs.enable_thinking});
   }
   const lastUser=body.messages.findLastIndex((message:any)=>message.role==='user');
   const hasResult=body.messages.some((message:any,index:number)=>index>lastUser&&message.role==='tool');
@@ -53,6 +63,9 @@ app.pipeline.contexts.set(run.id,{run,abort,agent,source,base:source,phase:'disc
 try{
   const exists=await app.pipeline.docker.command(['network','inspect',config.dockerNetwork]);if(exists.code)await app.pipeline.docker.command(['network','create',config.dockerNetwork]);
   await agent.start(abort.signal);
+  const activeConfig=await agent.request('/config');
+  assert.deepEqual(activeConfig.provider.nim.models['nvidia/nemotron-3-ultra-550b-a55b'].limit,{context:262144,input:196608,output:24576});
+  assert.equal(activeConfig.compaction.auto,true);assert.equal(activeConfig.compaction.prune,true);assert.equal(activeConfig.compaction.reserved,8192);
   for(const phase of ['discovery','review','reproduction','patching'] as const){
     activeCase=phase;app.pipeline.contexts.get(run.id)!.phase=phase;
     const answer=await agent.ask(`ADAPTER_INTEGRATION ${phase}: Use bugfix_read_source to read src/lib.rs, then Return exactly {"adapter":"ok","phase":"${phase}","evidenceRead":true}.`,AbortSignal.timeout(90000),answer=>answer.adapter==='ok'&&answer.phase===phase,phase);

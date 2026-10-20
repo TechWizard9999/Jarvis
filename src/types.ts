@@ -25,7 +25,7 @@ export interface Manifest {
   stageTimes?: { stage: Stage; startedAt: string; finishedAt?: string }[];
   agentImageId?: string; publisherImageId?: string; workerBaseImageId?: string;
   runConfig?: { artifact: string; sha256: string };
-  modelRequests?: { id: string; startedAt: string; finishedAt?: string; latencyMs?: number; attempts: number; model: string; inputTokens?: number; outputTokens?: number; totalTokens?: number; usage: 'unknown' | 'partial' | 'complete'; status: 'pending' | 'completed' | 'failed' | 'interrupted'; httpStatus?: number; settings?: Record<string, unknown>; settingsSha256?: string; promptSha256?: string }[];
+  modelRequests?: { id: string; startedAt: string; finishedAt?: string; latencyMs?: number; attempts: number; model: string; inputTokens?: number; outputTokens?: number; totalTokens?: number; reasoningTokens?: number; finishReason?: string; turnPurpose?: string; turnPurposeSource?: 'active_turn' | 'stage_fallback'; internalPurpose?: 'unknown'; contextLimits?: {context: number; input: number; compactionReserved: number}; usage: 'unknown' | 'partial' | 'complete'; status: 'pending' | 'completed' | 'failed' | 'interrupted'; httpStatus?: number; settings?: Record<string, unknown>; settingsSha256?: string; requestedSettings?: Record<string, unknown>; requestedSettingsSha256?: string; parameterOmissions?: { parameter: 'reasoning_budget'; reason: 'nvidia_v2_model_runner_unsupported'; source: 'provider_rejection' | 'cached_provider_rejection'; observedAt: string }[]; answerReserve?: 'requested' | 'unavailable' | 'not_requested'; promptSha256?: string }[];
   profile?: RepositoryProfile;
   id: string; input: RunInput; createdAt: string; updatedAt: string; stage: Stage; outcome?: Outcome;
   issue?: Issue; baseSha?: string; baseTree?: string; branch?: string; worktree?: string; sourceHash?: string;
@@ -39,6 +39,7 @@ export interface Manifest {
 export interface Config {
   modelTemperature: number; modelTopP: number; modelThinking: boolean; reasoningBudget: number;
   profile: RepositoryProfile; profilePath: string; providerBaseUrl: string; modelContext: number; modelMaxOutput: number;
+  modelInput: number; compactionReserved: number; allowUnverifiedContext: boolean; allowUnboundedReasoning: boolean;
   projectDir: string; stateDir: string; repoRoot: string; port: number; bind: string; model: string;
   fork: string; gitName: string; gitEmail: string; rustToolchain: string; docker: string;
   workerImage: string; agentImage: string; publisherImage: string; dockerNetwork: string;

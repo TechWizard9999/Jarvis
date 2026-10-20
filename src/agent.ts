@@ -63,7 +63,8 @@ export function agentConfig(run: Manifest, config: Config, providerToken: string
     $schema: 'https://opencode.ai/config.json', model: config.model, autoupdate: false, share: 'disabled', snapshot: false,
     permission: { '*': 'deny', 'bugfix_*': 'allow' },
     tools: Object.fromEntries([...nativeTools.map(n => [n, false]), ...toolNames.map(n => [`bugfix_${n}`, visibleTools(run).includes(`bugfix_${n}`)])]),
-    provider: { [provider]: { npm: '@ai-sdk/openai-compatible', options: { baseURL: `${config.controllerUrl}/provider/${run.id}/v1`, apiKey: providerToken }, models: { [config.model.slice(separator + 1)]: { name: config.model.slice(separator + 1), limit: { context: config.modelContext, output: config.modelMaxOutput } } } } },
+    provider: { [provider]: { npm: '@ai-sdk/openai-compatible', options: { baseURL: `${config.controllerUrl}/provider/${run.id}/v1`, apiKey: providerToken }, models: { [config.model.slice(separator + 1)]: { name: config.model.slice(separator + 1), limit: { context: config.modelContext, input: config.modelInput, output: config.modelMaxOutput } } } } },
+    compaction: { auto: true, prune: true, reserved: config.compactionReserved },
     agent: { bugfix: { description: 'Repository repair agent using controller tools', mode: 'primary', permission: { '*': 'deny', 'bugfix_*': 'allow' } } },
     default_agent: 'bugfix', formatter: false, lsp: false,
   };
@@ -77,6 +78,8 @@ export function parseAgentJson(text: string): any {
 export class Agent {
   config: Config; docker: Docker; store: Store; run: Manifest; url = ''; password = '';
   toolToken = randomBytes(32).toString('hex'); providerToken = randomBytes(32).toString('hex');
+  private activeTurnPurpose?: TurnPhase;
+  get turnPurpose(): TurnPhase | undefined { return this.activeTurnPurpose; }
   private eventAbort = new AbortController(); private transcript?: Transcript; private lastActivity = Date.now();
   constructor(config: Config, docker: Docker, store: Store, run: Manifest) { this.config = config; this.docker = docker; this.store = store; this.run = run; }
   async preflight(signal?: AbortSignal) {
@@ -196,17 +199,21 @@ export class Agent {
     }
   }
   private async turn(prompt: string, signal: AbortSignal, phase: TurnPhase): Promise<string> {
-    const contract = turnContract(this.run, this.config, phase);
-    const result = await this.longRequest(`/session/${this.run.sessionId}/message`, {
-      agent: 'bugfix', parts: [{ type: 'text', text: prompt }],
-      tools: contract.tools,
-      system: contract.system,
-    }, signal);
-    if (result.info?.error) throw new Error(`OpenCode/model error: ${JSON.stringify(result.info.error)}`);
-    const text = (result.parts || []).filter((p: any) => p.type === 'text').map((p: any) => p.text || '').join('\n');
-    if (this.transcript && result.info?.id) await this.recordTranscript(this.transcript.reconcile([result]));
-    else await this.store.event(this.run, 'opencode', 'final_message', text.slice(0, 30000), {role:'assistant',coverage:'unidentified_final_reply'});
-    return text;
+    if (this.activeTurnPurpose) throw new Error('Another agent turn is active');
+    this.activeTurnPurpose = phase;
+    try {
+      const contract = turnContract(this.run, this.config, phase);
+      const result = await this.longRequest(`/session/${this.run.sessionId}/message`, {
+        agent: 'bugfix', parts: [{ type: 'text', text: prompt }],
+        tools: contract.tools,
+        system: contract.system,
+      }, signal);
+      if (result.info?.error) throw new Error(`OpenCode/model error: ${JSON.stringify(result.info.error)}`);
+      const text = (result.parts || []).filter((p: any) => p.type === 'text').map((p: any) => p.text || '').join('\n');
+      if (this.transcript && result.info?.id) await this.recordTranscript(this.transcript.reconcile([result]));
+      else await this.store.event(this.run, 'opencode', 'final_message', text.slice(0, 30000), {role:'assistant',coverage:'unidentified_final_reply'});
+      return text;
+    } finally { this.activeTurnPurpose = undefined; }
   }
   // Stops the current turn so a retry does not queue behind or collide with it.
   async interrupt() { if (this.run.sessionId && this.url) { await this.request(`/session/${this.run.sessionId}/abort`, 'POST').catch(() => {}); await new Promise(resolve => setTimeout(resolve, 2000)); } }

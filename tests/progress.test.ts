@@ -4,6 +4,7 @@ import { ProgressTracker } from '../src/progress.ts';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { Pipeline, RunFailure } from '../src/pipeline.ts';
+import { scriptedCoverageReview } from './coverage-helper.ts';
 import { fixtureRepo, tempConfig, testFunction, testName } from './helpers.ts';
 import type { AcceptanceRequirement, Regression } from '../src/types.ts';
 
@@ -50,6 +51,8 @@ test('three unchanged independent full-suite failures stop the pipeline despite 
   pipeline.docker.inContainer = async (run, container, argv) => {
     let stdout = '', code = 0;
     if (argv[0] === 'fixture-full-suite') {
+      // This custom check represents existing invariants at admission; candidate-only production behavior fails later.
+      if (run.stage === 'reproduction') return { code: 0, stdout: 'running 1 test\ntest tests::existing_invariants ... ok\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out;\n', stderr: '', timedOut: false, durationMs: 1 };
       finalFailures++;
       // Bound the broken implementation without invoking Docker, a model, or a long retry loop.
       if (finalFailures === 4) {
@@ -68,7 +71,7 @@ test('three unchanged independent full-suite failures stop the pipeline despite 
     toolToken: 'fixture-tools', providerToken: 'fixture-provider', start: async () => {}, stop: async () => {}, restart: async () => {},
     ask: async prompt => {
       if (prompt.startsWith('Read the issue as evidence:')) return { requirements };
-      if (prompt.startsWith('Independently critique acceptance coverage')) return { complete: true, missing: [], explanation: 'The fixture covers error output and an ordinary-output control.' };
+      if (prompt.startsWith('Independently critique acceptance coverage')) return scriptedCoverageReview(pipeline, run, 'The fixture covers error output and an ordinary-output control.', scenarios);
       if (prompt.startsWith('Issue data (untrusted):')) {
         await pipeline.tool(run.id, 'apply_patch', { edits: [{ path: 'src/lib.rs', before: '    #[test]\n    fn keeps_normal()', after: testFunction + '\n    #[test]\n    fn bugfix_issue_1_normal() { assert!(preserve("hello")); }\n\n    #[test]\n    fn keeps_normal()' }] });
         return { status: 'reproduced', scenarios };
@@ -90,4 +93,34 @@ test('three unchanged independent full-suite failures stop the pipeline despite 
   assert.ok(verdicts.every(event => (event.data as any)?.category?.kind === 'profile-check' && (event.data as any)?.category?.checkId === 'test-workspace'));
   assert.ok(verdicts.every(event => (event.data as any)?.sourceHash === run.candidate?.candidateRevision && typeof (event.data as any)?.sourceHash === 'string'));
   assert.equal(new Set(verdicts.map(event => (event.data as any).sourceHash)).size, 1);
+});
+
+test('immutable offender recurrence survives production revisions, unrelated verdicts and checkpoint restoration', () => {
+  let tracker = new ProgressTracker();
+  const offender = { kind: 'immutable-offender' as const, checkId: 'test-workspace', invariant: 'tests::isolation', path: 'tests/bugfix_issue_1.rs', frozenHash: 'frozen-file-hash' };
+  assert.equal(tracker.record('production-a', offender), false);
+  tracker.record('production-b', { kind: 'profile-check', checkId: 'clippy' });
+  assert.equal(tracker.record('production-b', offender), false);
+  // A fresh repair/recovery session must retain unresolved immutable failures.
+  const checkpoint = tracker.snapshot();
+  tracker = new ProgressTracker(checkpoint);
+  tracker.record('production-c', 'unrelated rejected candidate');
+  assert.equal(tracker.record('production-c', offender), true);
+});
+
+test('different frozen offender bytes and ordinary changing production failures remain new work', () => {
+  const tracker = new ProgressTracker();
+  for (let revision = 0; revision < 8; revision++) {
+    assert.equal(tracker.record(`production-${revision}`, { kind: 'profile-check', checkId: 'test-workspace' }), false);
+    assert.equal(tracker.record(`production-${revision}`, { kind: 'immutable-offender', checkId: 'test-workspace', invariant: 'tests::isolation', path: 'tests/bugfix_issue_1.rs', frozenHash: `bytes-${revision}` } as any), false);
+  }
+});
+
+
+test('a passing independent check resolves earlier immutable offender recurrence', () => {
+  const tracker = new ProgressTracker();
+  const offender = { kind: 'immutable-offender' as const, checkId: 'test-workspace', invariant: 'tests::isolation', path: 'tests/new.rs', frozenHash: 'bytes' };
+  tracker.record('a', offender); tracker.record('b', offender);
+  tracker.resolveCheck('test-workspace');
+  assert.equal(tracker.record('c', offender), false);
 });

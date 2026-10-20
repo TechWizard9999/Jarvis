@@ -12,7 +12,9 @@ import { fastChecks, focusedCheck } from './checks.ts';
 import { checked } from './process.ts';
 import { writeReport, prTitle } from './report.ts';
 import { candidateEvidenceChecks, normalizeCandidateEvidence, validateEvidence } from './evidence.ts';
-import { ProgressTracker, type VerificationVerdict } from './progress.ts';
+import { ProgressTracker, type VerificationVerdict, type ImmutableOffender } from './progress.ts';
+import { rustTests } from './rust.ts';
+import { coverageReviewPromptSchema, validateCoverageReview } from './coverage-review.ts';
 import { fetchCompetingPullRequests } from './competing.ts';
 import { inspectPublication } from './publication.ts';
 import type { Candidate, CheckResult, Config, Issue, Manifest, Outcome, Regression, RunInput } from './types.ts';
@@ -21,23 +23,23 @@ import type { RepositoryProfile } from './profile.ts';
 import { OperationAdmission, bindPublicationIdentity, captureRunConfiguration } from './lifecycle.ts';
 import { fetchGitHubIssue, GitHubIssueError } from './github.ts';
 import { scenarioList, freezeRegressions, assertFrozenRegressions, assertAcceptanceResults, validateScenarioCoverage } from './acceptance.ts';
-import { regressionCheck, summarizeCheck, listTestsCheck, integrationTargetCheck, formatCheck, discoverTests, parseListedTests } from './checks.ts';
+import { regressionCheck, summarizeCheck, listTestsCheck, integrationTargetCheck, formatCheck, discoverTests, parseListedTests, cargoAdmissionBuild, cargoAdmissionDocs, parseCargoTestArtifacts, cargoAdmissionList, cargoAdmissionRun, artifactMatchesScenario, parseAdmissionTests, cargoAdmissionMetadata, assertAdmissionDocTargets } from './checks.ts';
 
 export class RunFailure extends Error { outcome: Outcome; constructor(outcome: Outcome, message: string) { super(message); this.outcome = outcome; } }
 // A Docker/harness fault (daemon, exec or container failure): retried without blaming the reproduction or the candidate.
 class HarnessFailure extends Error {}
 // A verification verdict about the candidate (a failing test or check): returned to the agent as repair feedback.
 class VerdictFailure extends Error {
-  category: VerificationVerdict;
-  constructor(category: VerificationVerdict, message: string) { super(message); this.category = category; }
+  category: VerificationVerdict; immutableOffenders: ImmutableOffender[];
+  constructor(category: VerificationVerdict, message: string, immutableOffenders: ImmutableOffender[] = []) { super(message); this.category = category; this.immutableOffenders = immutableOffenders; }
 }
 const harnessError = /Cannot connect to the Docker daemon|Error response from daemon|OCI runtime (?:exec|create|start) failed/;
-export interface RepairAgent { toolToken: string; providerToken: string; preflight?(signal?: AbortSignal): Promise<void>; start(signal: AbortSignal): Promise<void>; ask(prompt: string, signal: AbortSignal, valid?: (answer: any) => boolean, phase?: AgentPhase): Promise<any>; stop(): Promise<void>; interrupt?(): Promise<void>; restart?(signal: AbortSignal): Promise<void>; touch?(): void; }
+export interface RepairAgent { readonly turnPurpose?: AgentPhase | 'format'; toolToken: string; providerToken: string; preflight?(signal?: AbortSignal): Promise<void>; start(signal: AbortSignal): Promise<void>; ask(prompt: string, signal: AbortSignal, valid?: (answer: any) => boolean, phase?: AgentPhase): Promise<any>; stop(): Promise<void>; interrupt?(): Promise<void>; restart?(signal: AbortSignal): Promise<void>; touch?(): void; }
 interface RecoveryDiagnosis {
   kind: 'tool-error' | 'check-result-loop'; tool: string; args: unknown; phase: AgentPhase; sourceHash: string; signature: string;
   error?: string; check?: { name: string; argv: string[]; status?: CheckResult['status']; exitCode: number; timedOut: boolean; outputHash: string; progressOutputHash?: string };
 }
-interface Context { run: Manifest; abort: AbortController; agent: RepairAgent; source: string; base: string; phase: AgentPhase; queue: Promise<unknown>; providerRejected?: string; toolFailures?: ProgressTracker; checkProgress?: ProgressTracker; lastCheckSignature?: string; recoveryProgress?: ProgressTracker; recoveryReason?: RecoveryDiagnosis; checkedRevisions?: Map<string,string>; }
+interface Context { run: Manifest; abort: AbortController; agent: RepairAgent; source: string; base: string; phase: AgentPhase; queue: Promise<unknown>; providerRejected?: string; toolFailures?: ProgressTracker; checkProgress?: ProgressTracker; lastCheckSignature?: string; recoveryProgress?: ProgressTracker; recoveryReason?: RecoveryDiagnosis; checkedRevisions?: Map<string,string>; verificationProgress?: ProgressTracker; guardFailures?: Record<string, { category: VerificationVerdict; sourceHash: string; reason: string; immutableOffenders: ImmutableOffender[] }>; validProof?: { sourceHash: string; evidenceIds: number[] }; }
 export function validateInput(input: RunInput, profile: RepositoryProfile = defaultProfile): RunInput {
   if (!input || typeof input.repo !== 'string' || !path.isAbsolute(input.repo)) throw new Error('Provide an absolute repository path');
   const issue = new URL(input.issue);
@@ -108,7 +110,7 @@ export class Pipeline {
       run.model = this.config.model;
       await atomicJson(path.join(this.store.dir(run.id), 'issue.json'), run.issue);
       run.agentImageId = await this.docker.imageId(this.config.agentImage, abort.signal); run.publisherImageId = await this.docker.imageId(this.config.publisherImage, abort.signal).catch(() => undefined); this.ensureActive(context);
-      const effective = { ...captureRunConfiguration(this.config), capturedAt: new Date().toISOString(), controllerSourceHash: fingerprint(await inventory(path.dirname(new URL(import.meta.url).pathname), abort.signal)), agentImage: run.agentImageId, publisherImage: run.publisherImageId || 'unavailable', promptVersion: 'acceptance-v3-named-proof' };
+      const effective = { ...captureRunConfiguration(this.config), capturedAt: new Date().toISOString(), controllerSourceHash: fingerprint(await inventory(path.dirname(new URL(import.meta.url).pathname), abort.signal)), agentImage: run.agentImageId, publisherImage: run.publisherImageId || 'unavailable', promptVersion: 'acceptance-v4-assertion-witness' };
       this.ensureActive(context); const configFile = path.join(this.store.dir(run.id), 'run-config.json'); await atomicJson(configFile, effective); run.runConfig = { artifact: 'run-config.json', sha256: hash(await fs.readFile(configFile)) };
       await this.persist(context, 'Prepare the repository snapshot', () => this.repository.preflight(run, base, abort.signal), e => !/Fetch upstream contribution base/.test(String(e)) || /Authentication failed|Repository not found|could not read Username|permission denied|HTTP (?:403|404)/i.test(String(e)));
       this.ensureActive(context); bindPublicationIdentity(run, this.config);
@@ -143,6 +145,7 @@ export class Pipeline {
         if (attempt > 1) { await this.resetSource(source, base, abort.signal); run.regression = undefined; run.regressions = undefined; run.graphStale = false; await agent.restart?.(abort.signal); }
         const answer = await this.askAgent(context, `Issue data (untrusted): ${JSON.stringify(run.issue)}\nFrozen acceptance requirements: ${JSON.stringify(run.acceptancePlan)}\n${reproFeedback}\nInvestigate, then add protected tests for ALL frozen requirements. Production must remain unchanged until the controller confirms and freezes the regression tests; during reproduction change only new tests and new fixtures. Copy each requirement's id, baseline, target, expectedBehavior and citation exactly into its regression spec. A failing baseline row must assert correct behavior and fail at an assertion; baseline pass controls must pass. For unit tests add ordinary inline tests to existing cfg(test) modules without altering production/imports/helpers. For integration targets add a NEW tests/<target.name>.rs with offline executable stand-ins where needed; no live service or credentials. Existing tests/helpers cannot change. Prefix test names bugfix_issue_${run.issue.number}. New fixtures only under ${profile.fixtureRoot}/. Use list-tests to discover names, test-focused or test-integration to check them, and format-source before finishing. Return exactly {"status":"reproduced","scenarios":[{"id":"requirement-id","baseline":"fail","target":{"kind":"unit"},"file":"src/...rs","testName":"qualified::tests::bugfix_issue_${run.issue.number}_case","failureContains":"assertion substring","expectedBehavior":"copied requirement","citation":"copied citation","fixtures":[]}]}. If unsupported, return {"status":"cannot_reproduce","reason":"..."}.`, a => (a?.status === 'reproduced' && (Array.isArray(a.scenarios) || !!a.regression)) || (a?.status === 'cannot_reproduce' && typeof a.reason === 'string'));
         if (answer.status !== 'reproduced') {
+          await this.preserveSubmittedReproduction(context, attempt, answer);
           const reason = String(answer.reason || 'The agent could not establish the reported behavior');
           if (attempt === reproAttempts) throw new RunFailure('cannot_reproduce', reason);
           // Long tool-using turns sometimes end in a premature give-up; retry with the reason before concluding.
@@ -150,13 +153,14 @@ export class Pipeline {
           await this.store.event(run, 'verifier', 'repro_rejected', reproFeedback); continue;
         }
         try {
-          const specs = scenarioList(answer.scenarios || answer.regression); validateScenarioCoverage(run.acceptancePlan!, specs);
           await this.formatReproduction(context, attempt, answer);
-          run.regressions = await freezeRegressions(base, source, specs, profile); run.regression = run.regressions.find(r => r.spec.baseline !== 'pass') || run.regressions[0];
+          const specs = scenarioList(answer.scenarios || answer.regression); validateScenarioCoverage(run.acceptancePlan!, specs);
+          const draft = await freezeRegressions(base, source, specs, profile);
+          await this.admitReproduction(context, attempt, specs);
           await this.retryHarness(context, async () => {
             for (let repeat = 1; repeat <= 3; repeat++) {
               const results = [];
-              for (const scenario of run.regressions!) {
+              for (const scenario of draft) {
                 const spec = scenario.spec;
                 const result = await this.check(context, run.workerContainer!, `repro-${attempt}-${repeat}-${spec.id}`, regressionCheck(spec, profile), [spec.id!]);
                 if (spec.baseline !== 'pass' && (!spec.failureContains || !reproductionFailure(result.output, spec.testName, spec.failureContains))) {
@@ -166,19 +170,29 @@ export class Pipeline {
                 }
                 results.push({ ...result, scenarioId: spec.id! });
               }
-              assertAcceptanceResults(run.regressions!, results, 'baseline'); await assertFrozenRegressions(source, run.regressions!);
+              assertAcceptanceResults(draft, results, 'baseline'); await assertFrozenRegressions(source, draft);
             }
           });
           context.phase = 'review'; await agent.restart?.(abort.signal);
-          const review = await this.askAgent(context, `Independently critique acceptance coverage before implementation. Issue: ${JSON.stringify(run.issue)}\nFrozen requirements: ${JSON.stringify(run.acceptancePlan)}\nTests: ${JSON.stringify(specs)}\nInspect the actual tests with read tools. Check every explicit issue example, CLI formatting/status when applicable, edge forms, and controls. Edits/checks are disabled. Return exactly {"complete":true,"missing":[],"explanation":"why these tests cover the issue"}; set complete:false and name missing behavior if incomplete.`, a => typeof a?.complete === 'boolean' && Array.isArray(a?.missing) && typeof a?.explanation === 'string');
-          run.acceptanceReview = review; await atomicJson(path.join(this.store.dir(run.id), 'acceptance-review.json'), review);
+          const boundary = await this.store.event(run, 'controller', 'coverage_review_started', 'Fresh acceptance review requires current assertion witnesses', { attempt, sourceHash: fingerprint(await inventory(source, abort.signal)) });
+          const submittedReview = await this.askAgent(context, `Independently critique acceptance coverage before implementation. Issue: ${JSON.stringify(run.issue)}\nFrozen requirements: ${JSON.stringify(run.acceptancePlan)}\nTests: ${JSON.stringify(specs)}\nInspect the actual tests with read tools during THIS review; earlier source-read evidence is not eligible. Check every explicit issue example, CLI formatting/status when applicable, edge forms, and controls. Edits/checks are disabled. ${coverageReviewPromptSchema()}`, a => typeof a?.complete === 'boolean' && Array.isArray(a?.missing) && typeof a?.explanation === 'string');
+          await this.preserveReproductionArtifact(context, attempt, 'submitted acceptance review', () => atomicJson(path.join(this.store.dir(run.id), `reproduction/attempt-${attempt}/acceptance-review-submitted.json`), submittedReview));
+          const review = await validateCoverageReview(submittedReview, run.acceptancePlan!, draft, source, await this.store.events(run.id, boundary.seq), abort.signal);
+          await this.preserveReproductionArtifact(context, attempt, 'validated acceptance review', async () => {
+            await atomicJson(path.join(this.store.dir(run.id), `reproduction/attempt-${attempt}/acceptance-review.json`), review);
+            await atomicJson(path.join(this.store.dir(run.id), 'acceptance-review.json'), review);
+          });
+          run.acceptanceReview = review;
           context.phase = 'reproduction'; if (!review.complete || review.missing.length) throw new Error(`Acceptance review found gaps: ${JSON.stringify(review)}`);
-          await fs.rm(path.join(this.store.dir(run.id), 'regression-source'), { recursive: true, force: true });
-          await copySource(source, path.join(this.store.dir(run.id), 'regression-source'), abort.signal);
-          await atomicJson(path.join(this.store.dir(run.id), 'reproduction/frozen.json'), run.regressions);
-          await fs.writeFile(path.join(this.store.dir(run.id), 'reproduction/regression.patch'), await this.repository.diff(run, source, abort.signal));
+          await this.preserveReproductionArtifact(context, attempt, 'frozen regression snapshot and receipts', async () => {
+            await fs.rm(path.join(this.store.dir(run.id), 'regression-source'), { recursive: true, force: true });
+            await copySource(source, path.join(this.store.dir(run.id), 'regression-source'), abort.signal);
+            await atomicJson(path.join(this.store.dir(run.id), 'reproduction/frozen.json'), draft);
+            await fs.writeFile(path.join(this.store.dir(run.id), 'reproduction/regression.patch'), await this.repository.diff(run, source, abort.signal));
+          });
+          run.regressions = draft; run.regression = draft.find(r => r.spec.baseline !== 'pass') || draft[0];
           frozen = true;
-        } catch (e) { if (abort.signal.aborted || e instanceof RunFailure) throw e; context.phase = 'reproduction'; reproFeedback = `The controller rejected reproduction attempt ${attempt}: ${String(e)}. Source is reset to the original snapshot for the next attempt.`; await this.store.event(run, 'verifier', 'repro_rejected', reproFeedback); }
+        } catch (e) { if (abort.signal.aborted || e instanceof RunFailure) throw e; await atomicJson(path.join(this.store.dir(run.id), `reproduction/attempt-${attempt}/rejection.json`), { status: 'rejected', sourceHash: fingerprint(await inventory(source, abort.signal)), reason: e instanceof Error ? e.message : String(e), publicationEligible: false }); context.phase = 'reproduction'; reproFeedback = `The controller rejected reproduction attempt ${attempt}: ${String(e)}. Source is reset to the original snapshot for the next attempt.`; await this.store.event(run, 'verifier', 'repro_rejected', reproFeedback); }
       }
       if (!frozen || !run.regression) throw new RunFailure('cannot_reproduce', reproFeedback);
       await this.store.stage(run, 'patching', 'Regression frozen; trying a bounded minimal implementation change'); context.phase = 'patching';
@@ -187,7 +201,7 @@ export class Pipeline {
       // verification or the run is cancelled.
       // A harness fault during verification re-runs verification (5 in a row is a real environment problem).
       let feedback = '', verified = '', n = 0, workerRunning = true, reverify = false, harnessFaults = 0;
-      const frozenSource = path.join(this.store.dir(run.id), 'regression-source'); const progress = new ProgressTracker();
+      const frozenSource = path.join(this.store.dir(run.id), 'regression-source'); const progress = context.verificationProgress = new ProgressTracker();
       for (let round = 1; !verified; round++) {
         if (round > 1 && !reverify) {
           if (!workerRunning) { await this.restartWorker(context); workerRunning = true; }
@@ -197,11 +211,15 @@ export class Pipeline {
         let ready = reverify; reverify = false;
         if (!ready) for (let attempt = 1; attempt <= this.config.maxAttempts; attempt++) {
           n++; run.attempt = n; await this.store.save(run);
-          const answer = await this.askAgent(context, `The controller confirmed and froze ${run.regression.spec.testName}. Issue evidence: ${JSON.stringify(run.issue)}\nAcceptance checkpoint: ${JSON.stringify(run.acceptancePlan)}\nFrozen scenario tests: ${JSON.stringify((run.regressions || [run.regression]).map(r=>r.spec))}\nFix implementation only, preserving frozen test/fixtures, all existing tests, manifests and CI. ${feedback}\nUse replace_source/apply_patch and run_check as needed. After your final edit, re-read changed implementation and execute an exact frozen failing-baseline bug-scenario check; cite those current result evidence IDs. Module checks and whole-target checks are exploratory and cannot supply candidate proof, even when they pass.\nExact frozen bug-scenario run_check arguments: ${JSON.stringify(candidateEvidenceChecks((run.regressions || [run.regression]).map(r=>r.spec)))}\nExecute the applicable arguments above after your final edit. Do not cite stale, unrelated, zero-match or invented evidence. Return exactly {"explanation":"root cause, evidence, and resulting behavior","sourceReadEvidenceId":123,"bugCheckEvidenceId":456,"snapshots":[]}. Replace sourceReadEvidenceId 123 with the actual evidenceId from your current read_source result covering changed implementation lines. Replace bugCheckEvidenceId 456 with the actual evidenceId from your current passing exact frozen bug-scenario run_check result. These fields identify different tool roles: two run_check IDs cannot substitute for a source read. Emit JSON numbers, not quoted strings; do not include an evidenceIds array with the named fields. A justified snapshot update must list {"path":"...","owner":"changed source path","reason":"issue-grounded explanation"}; it will require human review. Stop honestly with {"cannot_fix":"reason"} if needed.`, a => typeof a?.explanation === 'string' || typeof a?.cannot_fix === 'string');
+          const checkpoint = await this.repairCheckpoint(context);
+          const answer = await this.askAgent(context, `The controller confirmed and froze ${run.regression.spec.testName}. Issue evidence: ${JSON.stringify(run.issue)}\nAcceptance checkpoint: ${JSON.stringify(run.acceptancePlan)}\nFrozen scenario tests: ${JSON.stringify((run.regressions || [run.regression]).map(r=>r.spec))}\nFix implementation only, preserving frozen test/fixtures, all existing tests, manifests and CI. Write the explanation as a concise technical root-cause, evidence and behavior summary for maintainers; omit references to models or automation. ${feedback}\nRepair checkpoint (current file changes, valid proof and unresolved guard failures): ${JSON.stringify(checkpoint)}\nUse replace_source/apply_patch and run_check as needed. After your final edit, re-read changed implementation and execute an exact frozen failing-baseline bug-scenario check; cite those current result evidence IDs. Module checks and whole-target checks are exploratory and cannot supply candidate proof, even when they pass.\nExact frozen bug-scenario run_check arguments: ${JSON.stringify(candidateEvidenceChecks((run.regressions || [run.regression]).map(r=>r.spec)))}\nExecute the applicable arguments above after your final edit. Do not cite stale, unrelated, zero-match or invented evidence. Return exactly {"explanation":"root cause, evidence, and resulting behavior","sourceReadEvidenceId":123,"bugCheckEvidenceId":456,"snapshots":[]}. Replace sourceReadEvidenceId 123 with the actual evidenceId from your current read_source result covering changed implementation lines. Replace bugCheckEvidenceId 456 with the actual evidenceId from your current passing exact frozen bug-scenario run_check result. These fields identify different tool roles: two run_check IDs cannot substitute for a source read. Emit JSON numbers, not quoted strings; do not include an evidenceIds array with the named fields. A justified snapshot update must list {"path":"...","owner":"changed source path","reason":"issue-grounded explanation"}; it will require human review. Stop honestly with {"cannot_fix":"reason"} if needed.`, a => typeof a?.explanation === 'string' || typeof a?.cannot_fix === 'string');
           if (answer.cannot_fix) {
-            if (progress.record(fingerprint(await inventory(source, abort.signal)), String(answer.cannot_fix))) throw new RunFailure('needs_attention', `Three unchanged cannot_fix verdicts: ${String(answer.cannot_fix)}. Evidence is preserved for diagnosis.`);
+            const preservedCandidate = await this.preserveRejectedCandidate(context, n, answer, new Error(`cannot_fix: ${String(answer.cannot_fix)}`));
+            const repeated = progress.record(preservedCandidate.sourceHash, String(answer.cannot_fix));
+            await this.repairCheckpoint(context);
+            if (repeated) throw new RunFailure('needs_attention', `Three unchanged cannot_fix verdicts: ${String(answer.cannot_fix)}. Evidence is preserved for diagnosis at ${preservedCandidate.artifact}.`);
             feedback = `In attempt ${n} you reported cannot_fix: ${String(answer.cannot_fix)}. The frozen test defines the required behavior; make the smallest implementation change that makes it pass without breaking other tests.`;
-            await this.store.event(run, 'verifier', 'candidate_rejected', feedback); await this.revertCandidate(context, frozenSource); continue;
+            await this.store.event(run, 'verifier', 'candidate_rejected', feedback, { preservedCandidate }); await this.revertCandidate(context, frozenSource); continue;
           }
           try {
             const proof = normalizeCandidateEvidence(answer), { evidenceIds } = proof;
@@ -218,10 +236,11 @@ export class Pipeline {
             }
             validateEvidence(answer, await this.store.events(run.id), Object.fromEntries(Object.entries(current).map(([file, value]) => [file, value.split(':').slice(1).join(':')])), changedSource, revision, (run.regressions || [run.regression]).filter(r=>r.spec.baseline!=='pass').map(r => r.spec.id || 'regression-1'));
             await assertCandidate(base, source, run.regressions || run.regression, run.candidate, profile);
+            context.validProof = { sourceHash: revision, evidenceIds };
             await this.retryHarness(context, async () => { for (const name of profile.fastCheckIds) {
               const argv = profile.checks[name];
               const check = await this.check(context, run.workerContainer!, `attempt-${n}-${name}`, argv);
-              if (check.exitCode || check.timedOut || check.status === 'no_match') throw new Error(`${name} failed; see event/log evidence ${check.log}\n${check.output.slice(-12000)}`);
+              if (check.exitCode || check.timedOut || check.status === 'no_match') throw new VerdictFailure({ kind: 'profile-check', checkId: name }, `${name} failed; see event/log evidence ${check.log}\n${check.output.slice(-12000)}`);
             }
               await this.acceptanceChecks(context, run.workerContainer!, `attempt-${n}`, 'candidate');
             });
@@ -232,7 +251,10 @@ export class Pipeline {
           } catch (e) {
             if (abort.signal.aborted || e instanceof RunFailure) throw e;
             const preservedCandidate = await this.preserveRejectedCandidate(context, n, answer, e);
-            if (progress.record(preservedCandidate.sourceHash, String(e))) throw new RunFailure('needs_attention', `Three unchanged rejected candidates: ${String(e)}. Evidence is preserved for diagnosis at ${preservedCandidate.artifact}.`);
+            if (e instanceof VerdictFailure) (context.guardFailures ||= {})[e.category.kind === 'profile-check' ? e.category.checkId : e.category.kind] = { category: e.category, sourceHash: preservedCandidate.sourceHash, reason: e.message.slice(-4000), immutableOffenders: e.immutableOffenders };
+            const repeated = progress.record(preservedCandidate.sourceHash, String(e));
+            await this.repairCheckpoint(context);
+            if (repeated) throw new RunFailure('needs_attention', `Three unchanged rejected candidates: ${String(e)}. Evidence is preserved for diagnosis at ${preservedCandidate.artifact}.`);
             // A rejected candidate is rolled back to the frozen reproduction so the next attempt starts clean.
             feedback = `Attempt ${n} rejected: ${String(e)}. Your edits were rolled back to the frozen reproduction state.`; await this.store.event(run, 'verifier', 'candidate_rejected', feedback, { preservedCandidate }); await this.revertCandidate(context, frozenSource);
           }
@@ -252,9 +274,11 @@ export class Pipeline {
           const verifier = await harness(this.docker.startWorker(run, target, run.image!, true, `verifier-${round}`, abort.signal)); started.push(verifier);
           await harness(this.docker.inContainer(run, verifier, ['python3', '/opt/bugfix/prepare.py', 'invalidate-workspace'], abort.signal).then(r => checked(r, 'Force rebuild of workspace code/tests')));
           await this.acceptanceChecks(context, verifier, `final-regression-${round}`, 'candidate', target).catch(e => { throw new VerdictFailure({ kind: 'acceptance' }, String(e)); });
+          if (context.guardFailures) delete context.guardFailures.acceptance;
           for (const [name, argv] of Object.entries(profile.checks)) {
             const result = await this.check(context, verifier, `final-${name}-${round}`, argv);
-            if (result.exitCode || result.timedOut || result.status === 'no_match') throw new VerdictFailure({ kind: 'profile-check', checkId: name }, `Final ${name} failed\n${result.output.slice(-12000)}`);
+            if (result.exitCode || result.timedOut || result.status === 'no_match') throw new VerdictFailure({ kind: 'profile-check', checkId: name }, `Final ${name} failed\n${result.output.slice(-12000)}`, await this.immutableOffenders(context, name, result.output, target));
+            progress.resolveCheck(name); if (context.guardFailures) delete context.guardFailures[name];
           }
           await assertFrozenRegressions(target, run.regressions || [run.regression]).catch(e => { throw new VerdictFailure({ kind: 'frozen-regression' }, String(e instanceof Error ? e.message : e)); });
           if (fingerprint(await inventory(target, abort.signal)) !== contentHash || await this.repository.tree(run, target, abort.signal) !== run.verifiedTree) throw new Error('Verified source changed during execution');
@@ -265,9 +289,14 @@ export class Pipeline {
           if (e instanceof VerdictFailure) {
             harnessFaults = 0;
             const sourceHash = fingerprint(await inventory(target, abort.signal));
+            const preservedCandidate = await this.preserveRejectedCandidate(context, n, run.candidate, e);
+            (context.guardFailures ||= {})[e.category.kind === 'profile-check' ? e.category.checkId : e.category.kind] = { category: e.category, sourceHash, reason: message.slice(-4000), immutableOffenders: e.immutableOffenders };
+            const repeatedOffenders = e.immutableOffenders.filter(offender => progress.record(sourceHash, offender));
             const repeated = progress.record(sourceHash, e.category);
+            await this.repairCheckpoint(context);
             feedback = `Independent verification of your change failed: ${message}. Fix the implementation so this passes while the frozen test keeps passing.`;
-            await this.store.event(run, 'verifier', 'verification_rejected', feedback.slice(0, 20000), { sourceHash, category: e.category });
+            await this.store.event(run, 'verifier', 'verification_rejected', feedback.slice(0, 20000), { sourceHash, category: e.category, immutableOffenders: e.immutableOffenders, preservedCandidate });
+            if (repeatedOffenders.length) throw new RunFailure('needs_attention', `Repeated repository invariant ${repeatedOffenders[0].invariant} in ${repeatedOffenders[0].checkId} identifies unchanged frozen bytes in ${repeatedOffenders[0].path} (${repeatedOffenders[0].frozenHash}). Production changes cannot repair this frozen reproduction. Candidate and verification evidence are preserved at ${preservedCandidate.artifact}; revise reproduction admission before retrying. Frozen bytes remain protected.`);
             if (repeated) throw new RunFailure('needs_attention', `Three unchanged independent verification verdicts (${e.category.kind}${e.category.kind === 'profile-check' ? `: ${e.category.checkId}` : ''}): ${message}. Evidence is preserved for diagnosis.`);
           } else {
             if (++harnessFaults >= 5) throw new RunFailure('environment_blocked', `Independent verification could not run 5 times in a row: ${message}`);
@@ -298,6 +327,93 @@ export class Pipeline {
     }
     return run;
   }
+  private async repairCheckpoint(context: Context) {
+    const current = await inventory(context.source, context.abort.signal), baseline = await inventory(context.base, context.abort.signal), sourceHash = fingerprint(current);
+    const checkpoint = { schemaVersion: 1, sourceHash, changedFiles: changedFiles(baseline, current), verificationProgress: context.verificationProgress?.snapshot(), unresolvedGuards: context.guardFailures || {}, validProof: context.validProof?.sourceHash === sourceHash ? context.validProof : null, frozenScenarios: (context.run.regressions || []).map(regression => ({ id: regression.spec.id, file: regression.spec.file, functionHash: regression.functionHash, wholeFileHash: regression.wholeFileHash })), publicationEligible: false };
+    await atomicJson(path.join(this.store.dir(context.run.id), 'repair-checkpoint.json'), checkpoint); return checkpoint;
+  }
+  private async immutableOffenders(context: Context, checkId: string, output: string, root: string): Promise<ImmutableOffender[]> {
+    const frozen = context.run.regressions || [], offenders: ImmutableOffender[] = [];
+    // This hard stop recognizes only RTK's audited source-only binary-isolation scanner. A generic
+    // production assertion can print a frozen fixture path while remaining repairable in production.
+    const markers = new Set(['CARGO_BIN_EXE_rtk', 'Command::new("rtk")', 'join("debug")', '"target/debug']);
+    for (const match of output.matchAll(/^---- ([^\n]+) stdout ----\r?\n([\s\S]*?)(?=^---- |^failures:|^test result:|(?![\s\S]))/gm)) {
+      const invariant = match[1], block = match[2];
+      if ((context.run.profile || this.config.profile).upstream !== 'rtk-ai/rtk' || invariant !== 'core::test_isolation::tests_that_spawn_rtk_isolate_their_data' || !block.includes('these files name the rtk binary themselves') || !block.includes('common::rtk_command()')) continue;
+      if (!output.includes(`test ${invariant} ... FAILED`) || frozen.some(regression => regression.spec.testName === invariant)) continue;
+      const origin = /panicked at ([A-Za-z0-9_./-]+\.rs):\d+:\d+:/.exec(block)?.[1]; if (origin !== 'src/core/test_isolation/mod.rs') continue;
+      let baseline: string; try { baseline = await fs.readFile(await sourcePath(context.base, origin), 'utf8'); } catch { continue; }
+      if (!rustTests(baseline).some(test => invariant === test.qualified || invariant.endsWith(`::${test.qualified}`))) continue;
+      for (const row of block.matchAll(/^ {2,}([A-Za-z0-9_./-]+): ([^\r\n]+)$/gm)) {
+        const relative = row[1], marker = row[2].trim(), related = frozen.filter(regression => regression.spec.file === relative || relative in regression.fixtureHashes);
+        if (!related.length || !markers.has(marker)) continue;
+        try { safeRelative(relative); await assertFrozenRegressions(root, related); } catch { continue; }
+        const bytes = await fs.readFile(await sourcePath(root, relative), 'utf8');
+        const immutable = related[0];
+        // For inline regressions, prove the reported marker occurs in the frozen test itself, rather than in
+        // adjacent production code that the agent can legitimately repair.
+        const markerInFrozen = immutable.wholeFileHash || immutable.fixtureHashes[relative]
+          ? bytes.includes(marker) : rustTests(bytes).some(test => related.some(regression => test.canonical && test.canonical.includes(marker) && regression.functionHash === hash(test.canonical)));
+        if (!markerInFrozen) continue;
+        const frozenHash = immutable.fixtureHashes[relative] || immutable.wholeFileHash || immutable.functionHash;
+        const offender: ImmutableOffender = { kind: 'immutable-offender', checkId, invariant, path: relative, frozenHash };
+        if (!offenders.some(value => JSON.stringify(value) === JSON.stringify(offender))) offenders.push(offender);
+      }
+    }
+    return offenders;
+  }
+  private async admitReproduction(context: Context, attempt: number, specs: Regression[]) {
+    const { run, source, abort } = context, profile = run.profile || this.config.profile;
+    const dir = path.join(this.store.dir(run.id), `reproduction/attempt-${attempt}`), sourceHash = fingerprint(await inventory(source, abort.signal));
+    const checks: unknown[] = [], excluded: unknown[] = [];
+    let status = 'rejected', reason = '';
+    try {
+      const perform = async (id: string, argv: string[], discovery = false, expectedCount?: number) => {
+        const result = await this.check(context, run.workerContainer!, `repro-${attempt}-admission-${id}`, argv);
+        checks.push({ id: result.id, argv, log: result.log, status: result.status, sourceHash: result.sourceHash });
+        if (result.sourceHash !== sourceHash || result.exitCode || result.timedOut || !discovery && result.status === 'no_match') throw new Error(`Reproduction admission ${id} failed; see ${result.log}\n${result.output.slice(-12000)}`);
+        if (expectedCount !== undefined) {
+          const matched = [...result.output.matchAll(/test result: (?:ok|FAILED)\. (\d+) passed; (\d+) failed; (\d+) ignored; (\d+) measured;/g)].reduce((sum, match) => sum + match.slice(1).reduce((n, value) => n + Number(value), 0), 0);
+          if (matched !== expectedCount) throw new Error(`Reproduction admission ${id} ran ${matched} tests but selected ${expectedCount}; no-match or incomplete execution cannot admit reproduction`);
+        }
+        return result;
+      };
+      await this.retryHarness(context, async () => {
+        for (const [id, argv] of Object.entries(profile.checks)) {
+          if (argv[0] !== 'cargo' || argv[1] !== 'test') { await perform(id, argv); continue; }
+          if (argv.includes('--doc')) { await perform(id, argv, true); continue; }
+          const built = await perform(`${id}-build`, cargoAdmissionBuild(argv), true);
+          const targets = parseCargoTestArtifacts(built.output); let listedCount = 0;
+          const metadata = cargoAdmissionMetadata(argv); if (metadata) assertAdmissionDocTargets((await perform(`${id}-metadata`, metadata, true)).output, targets);
+          for (const [index, target] of targets.entries()) {
+            const listing = await perform(`${id}-${index}-list`, cargoAdmissionList(argv, target), true);
+            const names = parseAdmissionTests(listing.output);
+            const failures = specs.filter(spec => spec.baseline === 'fail' && artifactMatchesScenario(target, spec, profile));
+            for (const scenario of specs.filter(spec => artifactMatchesScenario(target, spec, profile))) {
+              if (!names.includes(scenario.testName)) throw new Error(`Reproduction admission ${id} did not discover declared scenario ${scenario.id} in its canonical Cargo target`);
+            }
+            const omit = new Set(failures.map(spec => spec.testName)), allowed = names.filter(name => !omit.has(name));
+            excluded.push(...failures.map(spec => ({ checkId: id, target, scenarioId: spec.id, testName: spec.testName })));
+            listedCount += allowed.length;
+            // Chunk only to respect operating-system argv size; this is not a tool or work budget.
+            for (let start = 0; start < allowed.length; start += 512) {
+              const batch = allowed.slice(start, start + 512);
+              await perform(`${id}-${index}-tests-${start / 512}`, cargoAdmissionRun(argv, target, batch), false, batch.length);
+            }
+          }
+          if (!listedCount) throw new Error(`Reproduction admission ${id} discovered no runnable existing tests or controls`);
+          // Explicit target selectors may intentionally omit acceptance targets; their exact baseline checks still run below.
+          for (const [index, target] of targets.entries()) { const docs = cargoAdmissionDocs(argv, target); if (docs) await perform(`${id}-${index}-docs`, docs, true); }
+        }
+      });
+      if (fingerprint(await inventory(source, abort.signal)) !== sourceHash) throw new Error('Reproduction source changed during admission');
+      status = 'admitted';
+    } catch (error) { reason = error instanceof Error ? error.message : String(error); throw error; }
+    finally {
+      await atomicJson(path.join(dir, 'admission.json'), { schemaVersion: 1, status, sourceHash, checks, excluded, reason, publicationEligible: false });
+      await this.store.event(run, 'verifier', status === 'admitted' ? 'reproduction_admitted' : 'reproduction_admission_rejected', status === 'admitted' ? 'Existing repository checks and controls passed before regression freeze' : reason.slice(0, 20000), { artifact: `reproduction/attempt-${attempt}/admission.json`, sourceHash });
+    }
+  }
   private async acceptanceChecks(context: Context, container: string, prefix: string, stage: 'baseline' | 'candidate', root = context.source) {
     const scenarios = context.run.regressions || [context.run.regression!]; const results = [];
     for (const scenario of scenarios) {
@@ -315,12 +431,18 @@ export class Pipeline {
       context.checkedRevisions.set(container, revision);
       await this.store.event(run, 'cache', 'workspace_invalidated', 'Rebuilding workspace outputs for current source revision', {container,sourceHash:revision});
     }
-    await this.store.event(run, 'check', 'started', argv.join(' '), { id });
+    const started = await this.store.event(run, 'check', 'started', argv.join(' '), { id });
     const result = await this.docker.inContainer(run, container, argv, context.abort.signal);
     if (result.code && !context.abort.signal.aborted && harnessError.test(result.stderr)) throw new HarnessFailure(`Docker could not run ${id}: ${result.stderr.slice(0, 500)}`);
-    const relative = `${run.stage === 'verification' ? 'verification' : run.stage === 'reproduction' ? 'reproduction' : `candidates/${run.attempt}`}/${id}.log`;
+    let relative = `${run.stage === 'verification' ? 'verification' : run.stage === 'reproduction' ? 'reproduction' : `candidates/${run.attempt}`}/${id}.log`;
     await fs.mkdir(path.dirname(path.join(this.store.dir(run.id), relative)), { recursive: true });
-    const output = result.stdout + result.stderr; await fs.writeFile(path.join(this.store.dir(run.id), relative), output);
+    const output = result.stdout + result.stderr;
+    try { await fs.writeFile(path.join(this.store.dir(run.id), relative), output, { flag: 'wx' }); }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+      relative = relative.replace(/\.log$/, `-event-${started.seq}.log`);
+      await fs.writeFile(path.join(this.store.dir(run.id), relative), output, { flag: 'wx' });
+    }
     const check: CheckResult = { id, argv, exitCode: result.code, durationMs: result.durationMs, log: relative, timedOut: result.timedOut, ...summarizeCheck(output, result.code, result.timedOut, argv), scenarioIds, sourceHash: revision, candidateRevision: revision, stage: run.stage, attempt: run.attempt };
     run.checks.push(check); await this.store.save(run); await this.store.event(run, 'check', 'finished', `${id}: exit ${result.code}`, check);
     return { ...check, output };
@@ -401,9 +523,10 @@ export class Pipeline {
         if (diagnosis) {
           const sourceHash = fingerprint(await inventory(context.source, context.abort.signal));
           const stalled = (context.recoveryProgress ||= new ProgressTracker()).record(sourceHash, { kind: 'agent-recovery', phase: context.phase, signature: JSON.stringify([diagnosis.kind, diagnosis.signature]) });
-          await this.store.event(context.run, 'controller', 'recovery_checkpoint', 'Checking progress across agent recovery', { ...diagnosis, phase: context.phase, sourceHash, stalled });
+          const repair = context.verificationProgress ? await this.repairCheckpoint(context) : undefined;
+          await this.store.event(context.run, 'controller', 'recovery_checkpoint', 'Checking progress across agent recovery', { ...diagnosis, phase: context.phase, sourceHash, stalled, ...(repair ? { repair } : {}) });
           if (stalled) throw new RunFailure('needs_attention', `3 identical unchanged agent recovery checkpoints in ${context.phase}: ${diagnosis.kind} for ${diagnosis.tool}; source ${sourceHash}. Inspect diagnosis and tool evidence before retrying.`);
-          prompt += `\nRecovery checkpoint: ${JSON.stringify(diagnosis)}. Re-read current source and use a smaller valid operation. Do not repeat the unchanged operation.`;
+          prompt += `\nRecovery checkpoint: ${JSON.stringify(diagnosis)}. ${repair ? `Current repair checkpoint: ${JSON.stringify(repair)}.` : ''} Re-read current source and use a smaller valid operation. Do not repeat the unchanged operation.`;
           context.toolFailures = undefined; context.checkProgress = undefined;
         }
         const message = String(e instanceof Error ? e.message : e).slice(0, 300), wait = Math.min(60, 5 * failure);
@@ -529,8 +652,15 @@ export class Pipeline {
       throw error;
     }
   }
-  private async formatReproduction(context: Context, attempt: number, answer: unknown) {
-    const { run, source, abort } = context, profile = run.profile || this.config.profile;
+  private async preserveReproductionArtifact(context: Context, attempt: number, label: string, write: () => Promise<unknown>) {
+    try { await write(); this.ensureActive(context); }
+    catch (error) {
+      if (context.abort.signal.aborted || error instanceof RunFailure) throw error;
+      throw new RunFailure('needs_attention', `Unable to preserve reproduction artifact (${label}) for attempt ${attempt}: ${String(error)}. Submitted source has not been reset; partial artifacts are retained.`);
+    }
+  }
+  private async preserveSubmittedReproduction(context: Context, attempt: number, answer: unknown) {
+    const { run, source, abort } = context;
     const dir = path.join(this.store.dir(run.id), 'reproduction', `attempt-${attempt}`);
     let submitted: Record<string, string>, submittedSourceHash: string;
     try {
@@ -544,6 +674,11 @@ export class Pipeline {
       if (abort.signal.aborted) throw error;
       throw new RunFailure('needs_attention', `Unable to preserve submitted reproduction before formatting: ${String(error)}. Source has not been reset; partial artifacts are retained at reproduction/attempt-${attempt}.`);
     }
+    return { dir, submitted, submittedSourceHash };
+  }
+  private async formatReproduction(context: Context, attempt: number, answer: unknown) {
+    const { run, source, abort } = context, profile = run.profile || this.config.profile;
+    const { dir, submitted, submittedSourceHash } = await this.preserveSubmittedReproduction(context, attempt, answer);
     // Freeze only after trusted normalization. A later formatter must never waive frozen bytes.
     await this.retryHarness(context, async () => {
       const normalized = await this.formatSource(context, formatCheck(profile), `repro-${attempt}-format-source`);

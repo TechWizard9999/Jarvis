@@ -79,3 +79,32 @@ test('a locked turn exposes no tools', async t => {
   await agent.ask('Return exactly {"complete":true}.', AbortSignal.timeout(5000), undefined, 'locked');
   assert.deepEqual(enabled(bodies[0]), []);
 });
+
+test('trusted purpose covers format retry and is cleared after successful and failed turns', async t => {
+  const { agent } = await fixture(t);
+  const purposes: unknown[] = [];
+  let calls = 0;
+  (agent as any).longRequest = async () => {
+    purposes.push((agent as any).turnPurpose);
+    return { info: {}, parts: [{ type: 'text', text: ++calls === 1 ? 'not JSON' : '{"complete":true}' }] };
+  };
+  await agent.ask('Return exactly {"complete":true}.', AbortSignal.timeout(5000), undefined, 'review');
+  assert.deepEqual(purposes, ['review', 'format']); assert.equal((agent as any).turnPurpose, undefined);
+  (agent as any).longRequest = async () => { assert.equal((agent as any).turnPurpose, 'patching'); throw new Error('fixture transport failure'); };
+  await assert.rejects(agent.ask('Return exactly {}.', AbortSignal.timeout(5000), undefined, 'patching'), /fixture transport failure/);
+  assert.equal((agent as any).turnPurpose, undefined);
+});
+
+test('overlapping turns cannot overwrite the trusted purpose of a running turn', async t => {
+  const { agent } = await fixture(t);
+  let release!: () => void;
+  const held = new Promise<void>(resolve => { release = resolve; });
+  let calls = 0;
+  (agent as any).longRequest = async () => { if (++calls === 1) await held; return { info: {}, parts: [{ type: 'text', text: '{}' }] }; };
+  const running = agent.ask('Return exactly {}.', AbortSignal.timeout(5000), undefined, 'reproduction');
+  try {
+    await assert.rejects(agent.ask('Return exactly {}.', AbortSignal.timeout(5000), undefined, 'discovery'), /Another agent turn is active/);
+    assert.equal(agent.turnPurpose, 'reproduction');
+  } finally { release(); await running; }
+  assert.equal(agent.turnPurpose, undefined);
+});

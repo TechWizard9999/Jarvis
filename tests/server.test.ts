@@ -88,3 +88,39 @@ test('history uses exclusive cursors and permits only safe evidence artifacts', 
   assert.equal((await fetch(base+'/artifact?path=run-config.json',{headers})).status,200);
   for(const file of ['agent/opencode.json','agent-secrets/bridge_token','../../.env'])assert.equal((await fetch(base+'/artifact?path='+encodeURIComponent(file),{headers})).status,400);
 });
+
+test('gateway uses trusted turn purpose, records effective settings and preserves unknown internal metadata', async t => {
+  const {root,config}=await tempConfig();config.model='nim/nvidia/nemotron-3-ultra-550b-a55b';await fs.mkdir(path.dirname(config.nvidiaSecret),{recursive:true});await fs.writeFile(config.nvidiaSecret,'fixture-key');
+  const outbound:any[]=[];let response=0;
+  const providerRequest=(async(_url:any,init:any)=>{outbound.push(JSON.parse(init.body));return new Response(JSON.stringify(++response===1?{choices:[{finish_reason:'length'}],usage:{prompt_tokens:20,completion_tokens:12,total_tokens:32,completion_tokens_details:{reasoning_tokens:9}}}:{choices:[]}),{headers:{'content-type':'application/json'}});}) as typeof fetch;
+  const app=await createServer(config,{recover:false,providerRequest});await new Promise<void>(resolve=>app.server.listen(0,'127.0.0.1',resolve));
+  t.after(async()=>{app.server.closeAllConnections();await new Promise<void>(resolve=>app.server.close(()=>resolve()));await fs.rm(root,{recursive:true,force:true});});
+  const run=await app.store.create({repo:'/repo',issue:'https://github.com/rtk-ai/rtk/issues/1'});
+  const agent={providerToken:'gw',turnPurpose:'format' as string|undefined};
+  app.pipeline.contexts.set(run.id,{run,abort:new AbortController(),agent,phase:'patching',queue:Promise.resolve()} as any);
+  const ask=()=>fetch(`http://127.0.0.1:${(app.server.address() as {port:number}).port}/provider/${run.id}/v1/chat/completions`,{method:'POST',headers:{authorization:'Bearer gw','content-type':'application/json'},body:JSON.stringify({model:'nvidia/nemotron-3-ultra-550b-a55b',messages:[],turnPurpose:'discovery',reasoning_budget:-1,reasoning_effort:'high'})});
+  await(await ask()).text();agent.turnPurpose=undefined;await(await ask()).text();
+  assert.equal(outbound[0].max_tokens,2048);assert.equal(outbound[0].reasoning_effort,'none');assert.equal(outbound[0].reasoning_budget,undefined);
+  assert.equal(outbound[1].max_tokens,24576);assert.equal(outbound[1].reasoning_effort,'high');assert.equal(outbound[1].reasoning_budget,16384);
+  const records=run.modelRequests as any[];
+  assert.equal(records[0].turnPurpose,'format');assert.equal(records[0].turnPurposeSource,'active_turn');assert.equal(records[0].internalPurpose,'unknown');
+  assert.equal(records[1].turnPurpose,'patching');assert.equal(records[1].turnPurposeSource,'stage_fallback');assert.equal(records[1].internalPurpose,'unknown');
+  assert.equal(records[0].reasoningTokens,9);assert.equal(records[0].finishReason,'length');assert.equal(records[1].reasoningTokens,undefined);assert.equal(records[1].finishReason,undefined);
+  assert.equal(records[0].settings.chat_template_kwargs.medium_effort,false);
+  assert.deepEqual(records[0].contextLimits,{context:262144,input:196608,compactionReserved:8192});
+  for(const key of ['model_context','model_input','compaction_reserved']) {
+    assert.equal(records[0].settings[key],undefined,'Configured context metadata must not masquerade as an outbound generation control');
+    assert.equal(outbound[0][key],undefined);
+  }
+});
+
+test('provider request capacity accepts a supported-context body beyond old limit and rejects finite overflow', async t => {
+  const {root,config}=await tempConfig();await fs.mkdir(path.dirname(config.nvidiaSecret),{recursive:true});await fs.writeFile(config.nvidiaSecret,'fixture-key');
+  let calls=0;const providerRequest=(async()=>{calls++;return new Response('{"choices":[]}',{headers:{'content-type':'application/json'}});}) as typeof fetch;
+  const app=await createServer(config,{recover:false,providerRequest});await new Promise<void>(resolve=>app.server.listen(0,'127.0.0.1',resolve));
+  t.after(async()=>{app.server.closeAllConnections();await new Promise<void>(resolve=>app.server.close(()=>resolve()));await fs.rm(root,{recursive:true,force:true});});
+  const run=await app.store.create({repo:'/repo',issue:'https://github.com/rtk-ai/rtk/issues/1'});app.pipeline.contexts.set(run.id,{run,abort:new AbortController(),agent:{providerToken:'gw'},phase:'discovery',queue:Promise.resolve()} as any);
+  const ask=(length:number)=>fetch(`http://127.0.0.1:${(app.server.address() as {port:number}).port}/provider/${run.id}/v1/chat/completions`,{method:'POST',headers:{authorization:'Bearer gw','content-type':'application/json'},body:JSON.stringify({model:'fixture-model',messages:[{role:'user',content:'x'.repeat(length)}]})});
+  const accepted=await ask(4_100_000);assert.equal(accepted.status,200);await accepted.text();
+  const rejected=await ask(10_000_000);assert.equal(rejected.status,400);assert.match(await rejected.text(),/too large.*limit/i);assert.equal(calls,1);
+});

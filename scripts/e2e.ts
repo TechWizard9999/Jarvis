@@ -7,6 +7,7 @@ import { Pipeline } from '../src/pipeline.ts';
 import { loadConfig } from '../src/config.ts';
 import { Store, atomicJson } from '../src/store.ts';
 import { fixtureRepo, original, testFunction, testName } from '../tests/helpers.ts';
+import { scriptedCoverageReview } from '../tests/coverage-helper.ts';
 import { checked } from '../src/process.ts';
 import type { RepairAgent } from '../src/pipeline.ts';
 import type { AcceptanceRequirement, CheckResult, Manifest, Regression } from '../src/types.ts';
@@ -130,9 +131,9 @@ class ScriptedAgent implements RepairAgent {
       return { status: 'reproduced', scenarios: structuredClone(scenarios) };
     }
     if (prompt.startsWith('Independently critique acceptance coverage')) {
-      this.phases.push('review'); assert.equal(this.run.regressions?.length, 4, 'Coverage review must inspect all frozen scenarios');
+      this.phases.push('review'); assert.equal(this.run.regressions, undefined, 'Manifest must not claim frozen scenarios before review succeeds'); assert.equal(scenarios.length, 4, 'Coverage review must inspect all submitted scenarios');
       for (const file of ['src/lib.rs', 'tests/cli_acceptance.rs']) await engine.tool(this.run.id, 'read_source', { path: file });
-      return { complete: true, missing: [], explanation: 'Both library and actual CLI output reproduce the error-line bug, with ordinary output controls passing on the baseline. CLI tests independently assert stdout, stderr, and exit status using an offline Cargo-built executable.' };
+      return scriptedCoverageReview(engine, this.run, 'Both library and actual CLI output reproduce the error-line bug, with ordinary output controls passing on the baseline. CLI tests independently assert stdout, stderr, and exit status using an offline Cargo-built executable.', scenarios);
     }
     if (prompt.startsWith('The controller confirmed and froze')) {
       this.phases.push('patch');

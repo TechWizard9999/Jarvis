@@ -5,6 +5,7 @@ import path from 'node:path';
 import { Pipeline } from '../src/pipeline.ts';
 import { assertFrozenRegressions, freezeRegressions } from '../src/acceptance.ts';
 import { copySource, fingerprint, hash, inventory } from '../src/files.ts';
+import { scriptedCoverageReview } from './coverage-helper.ts';
 import { fixtureRepo, tempConfig } from './helpers.ts';
 import type { AcceptanceRequirement, Regression } from '../src/types.ts';
 
@@ -66,7 +67,7 @@ async function exercise(t: test.TestContext, mode: FormatMode) {
       }
       submittedAnswer = { status: 'reproduced', scenarios: structuredClone(scenarios) }; return submittedAnswer;
     }
-    if (prompt.startsWith('Independently critique acceptance coverage')) { reviewSources.push(await fs.readFile(path.join(pipeline.store.dir(run.id), 'source', file), 'utf8')); return { complete: true, missing: [], explanation: 'Both exact error and normal control tests are present.' }; }
+    if (prompt.startsWith('Independently critique acceptance coverage')) { reviewSources.push(await fs.readFile(path.join(pipeline.store.dir(run.id), 'source', file), 'utf8')); return scriptedCoverageReview(pipeline, run, 'Both exact error and normal control tests are present.', scenarios); }
     await pipeline.tool(run.id, 'replace_source', { path: 'src/lib.rs', before: '!line.starts_with("error:")', after: '!line.is_empty()' });
     const read = await pipeline.tool(run.id, 'read_source', { path: 'src/lib.rs' });
     const check = await pipeline.tool(run.id, 'run_check', { check: 'test-integration', target: 'bugfix_issue_1', test: 'bugfix_issue_1_error' });

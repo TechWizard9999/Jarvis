@@ -4,6 +4,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { Pipeline } from '../src/pipeline.ts';
 import { fixtureRepo, tempConfig, testFunction, testName } from './helpers.ts';
+import { scriptedCoverageReview } from './coverage-helper.ts';
 import type { AcceptanceRequirement, Regression } from '../src/types.ts';
 
 type ProofMode = 'current' | 'unknown' | 'duplicate' | 'stale' | 'module' | 'named-current' | 'named-string' | 'named-swapped' | 'named-unknown' | 'named-stale' | 'named-module' | 'named-control' | 'named-duplicate' | 'named-mixed' | 'named-partial' | 'named-all-checks';
@@ -40,7 +41,7 @@ async function exercise(t: test.TestContext, mode: ProofMode) {
     ask: async (prompt, _signal, _valid, phase) => {
       agentPhases.push(phase);
       if (prompt.startsWith('Read the issue as evidence:')) return { requirements };
-      if (prompt.startsWith('Independently critique acceptance coverage')) return { complete: true, missing: [], explanation: 'The error case and ordinary control are present.' };
+      if (prompt.startsWith('Independently critique acceptance coverage')) return scriptedCoverageReview(pipeline, run, 'The error case and ordinary control are present.', scenarios);
       if (prompt.startsWith('Issue data (untrusted):')) {
         await pipeline.tool(run.id, 'apply_patch', { edits: [{ path: 'src/lib.rs', before: '    #[test]\n    fn keeps_normal()', after: testFunction + '\n    #[test]\n    fn bugfix_issue_1_normal() { assert!(preserve("hello")); }\n\n    #[test]\n    fn keeps_normal()' }] });
         return { status: 'reproduced', scenarios };

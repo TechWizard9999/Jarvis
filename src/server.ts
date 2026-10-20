@@ -1,4 +1,4 @@
-import { providerBody, providerRetrySeconds } from './provider.ts';
+import { providerBody, providerRetrySeconds, rejectsReasoningBudget, type ModelTurnPurpose } from './provider.ts';
 import { setTimeout as sleep } from 'node:timers/promises';
 import http from 'node:http';
 import fs from 'node:fs/promises';
@@ -15,9 +15,17 @@ import type { Config, RunEvent, Manifest } from './types.ts';
 
 const publicDir = fileURLToPath(new URL('../public/', import.meta.url));
 const equal = (a: string, b: string) => { const x = Buffer.from(a), y = Buffer.from(b); return x.length === y.length && timingSafeEqual(x, y); };
+function providerSettings(body: Record<string, any>): Record<string, unknown> {
+  const settings = Object.fromEntries(['model','max_tokens','temperature','top_p','top_k','min_p','seed','presence_penalty','frequency_penalty','reasoning_effort','reasoning_budget'].filter(key => ['string','number','boolean'].includes(typeof body[key])).map(key => [key,body[key]]));
+  for (const [key, fields] of [['thinking',['type','budget_tokens']],['reasoning',['effort','max_tokens','summary']],['chat_template_kwargs',['enable_thinking','medium_effort']]] as const) {
+    const source = body[key];
+    if (source && typeof source === 'object') settings[key] = Object.fromEntries(fields.filter(field => ['string','number','boolean'].includes(typeof source[field])).map(field => [field,source[field]]));
+  }
+  return settings;
+}
 async function jsonBody(req: http.IncomingMessage, max = 4_000_000): Promise<any> {
   let size = 0; const parts: Buffer[] = [];
-  for await (const chunk of req) { size += chunk.length; if (size > max) throw new Error('Request body is too large'); parts.push(chunk); }
+  for await (const chunk of req) { size += chunk.length; if (size > max) throw new Error(`Request body is too large (limit ${max} bytes)`); parts.push(chunk); }
   return JSON.parse(Buffer.concat(parts).toString('utf8') || '{}');
 }
 export async function createServer(config: Config, options: { recover?: boolean; providerRequest?: typeof fetch } = {}) {
@@ -26,6 +34,8 @@ export async function createServer(config: Config, options: { recover?: boolean;
   const uiToken = (await fs.readFile(tokenFile, 'utf8').catch(() => '')).trim() || randomBytes(32).toString('hex');
   await fs.writeFile(tokenFile, uiToken, { mode: 0o600 });
   const store = new Store(config.stateDir); const pipeline = new Pipeline(config, store);
+  // An observed capability is scoped to this controller lifetime and exact configured endpoint/model.
+  const unsupportedBudgets = new Map<string, { observedAt: string }>();
   if (options.recover !== false) await pipeline.recover();
   const json = (res: http.ServerResponse, data: unknown, code = 200) => { if(res.destroyed || res.writableEnded)return;res.writeHead(code, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' }); res.end(JSON.stringify(data)); };
   const server = http.createServer(async (req, res) => {
@@ -46,30 +56,44 @@ export async function createServer(config: Config, options: { recover?: boolean;
         pipeline.ensureActive(context);
         if (provider[2] === 'models' && req.method === 'GET') return json(res, { object: 'list', data: [{ id: config.model.split('/').slice(1).join('/'), object: 'model' }] });
         if (req.method !== 'POST' || context.phase === 'locked') return json(res, { error: 'Model requests are unavailable in this stage' }, 409);
-        const input = await jsonBody(req); const filtered = filterProviderTools(context.run, input);
+        // JSON escaping and tool schemas add bytes beyond tokenized input. Keep capacity finite and context-aware.
+        const bodyLimit = Math.max(4_000_000, config.modelContext * 32 + 1_000_000);
+        const input = await jsonBody(req, bodyLimit); const filtered = filterProviderTools(context.run, input);
         const expectedModel = config.model.slice(config.model.indexOf('/') + 1);
         if (input.model !== expectedModel) return json(res, { error: 'Model ID does not match the recorded configuration' }, 400);
         const key = (await fs.readFile(config.nvidiaSecret, 'utf8')).trim();
         if (!key || /\s/.test(key)) throw new Error('NVIDIA secret file is empty or invalid');
         // Per-request output is capped at the model's configured limit; total usage is only reported, never capped.
-        const body = providerBody(filtered.body,config);
+        const turnPurpose = context.agent.turnPurpose || context.phase;
+        const turnPurposeSource = context.agent.turnPurpose ? 'active_turn' : 'stage_fallback';
+        const body = providerBody(filtered.body,config,turnPurpose as ModelTurnPurpose);
         const target = new URL(config.providerBaseUrl.endsWith('/') ? config.providerBaseUrl : config.providerBaseUrl + '/');
         if (target.protocol !== 'https:' || target.username || target.password) throw new Error('The NVIDIA endpoint must be a credential-free HTTPS URL');
-        const settings = Object.fromEntries(['model','max_tokens','temperature','top_p','top_k','min_p','seed','presence_penalty','frequency_penalty','reasoning_effort','reasoning_budget'].filter(key => ['string','number','boolean'].includes(typeof (body as Record<string, unknown>)[key])).map(key => [key,(body as Record<string, unknown>)[key]]));
-        for(const [key,fields] of [['thinking',['type','budget_tokens']],['reasoning',['effort','max_tokens','summary']],['chat_template_kwargs',['enable_thinking']]] as const){const source=(body as Record<string, any>)[key];if(source && typeof source==='object')settings[key]=Object.fromEntries(fields.filter(field=>['string','number','boolean'].includes(typeof source[field])).map(field=>[field,source[field]]));}
+        const requestedSettings = providerSettings(body);
+        const capabilityKey = JSON.stringify([target.href, body.model]);
+        const cachedBudget = typeof body.reasoning_budget === 'number' ? unsupportedBudgets.get(capabilityKey) : undefined;
+        if (cachedBudget) delete body.reasoning_budget;
+        const settings = providerSettings(body);
         const hash = (value: unknown) => createHash('sha256').update(JSON.stringify(value)).digest('hex');
-        const record: NonNullable<Manifest['modelRequests']>[number] & {settings: Record<string, unknown>; settingsSha256: string; promptSha256: string} = {id:randomBytes(12).toString('hex'),startedAt:new Date().toISOString(),attempts:0,model:input.model,usage:'unknown',status:'pending',settings,settingsSha256:hash(settings),promptSha256:hash(input.messages || [])};
+        // The active controller turn does not identify OpenCode's internal requests (for example compaction).
+        const contextLimits = { context: config.modelContext, input: config.modelInput, compactionReserved: config.compactionReserved };
+        const record: NonNullable<Manifest['modelRequests']>[number] & {settings: Record<string, unknown>; settingsSha256: string; promptSha256: string} = {id:randomBytes(12).toString('hex'),startedAt:new Date().toISOString(),attempts:0,model:input.model,turnPurpose,turnPurposeSource,internalPurpose:'unknown',contextLimits,usage:'unknown',status:'pending',settings,settingsSha256:hash(settings),requestedSettings,requestedSettingsSha256:hash(requestedSettings),answerReserve:cachedBudget?'unavailable':typeof body.reasoning_budget==='number' && body.reasoning_budget>0?'requested':'not_requested',promptSha256:hash(input.messages || [])};
+        if (cachedBudget) record.parameterOmissions = [{ parameter:'reasoning_budget',reason:'nvidia_v2_model_runner_unsupported',source:'cached_provider_rejection',observedAt:cachedBudget.observedAt }];
         (context.run.modelRequests ||= []).push(record); await store.save(context.run);
-        await store.event(context.run, 'gateway', 'model_request', 'Approved outbound model tool list', {requestId:record.id,tools:filtered.names,removedTools:filtered.removed,model:input.model,settings,settingsSha256:record.settingsSha256,promptSha256:record.promptSha256});
+        await store.event(context.run, 'gateway', 'model_request', 'Approved outbound model tool list', {requestId:record.id,tools:filtered.names,removedTools:filtered.removed,model:input.model,turnPurpose,turnPurposeSource,internalPurpose:record.internalPurpose,contextLimits,settings,settingsSha256:record.settingsSha256,requestedSettings,requestedSettingsSha256:record.requestedSettingsSha256,parameterOmissions:record.parameterOmissions,answerReserve:record.answerReserve,promptSha256:record.promptSha256});
         // One request lives until the run is cancelled or the agent disconnects (OpenCode then sends a new request).
         let completed = false, interrupted = false;
         const readUsage = (data: any) => {
+          const finish = Array.isArray(data?.choices) ? data.choices.find((choice: any) => typeof choice?.finish_reason === 'string')?.finish_reason : undefined;
+          if (finish !== undefined) record.finishReason = finish;
           const usage=data?.usage;if(!usage || typeof usage!=='object')return;
           const count=(...keys: string[])=>{for(const key of keys){const value=usage[key];if(typeof value==='number' && Number.isFinite(value) && value>=0)return value;}return undefined;};
           const input=count('prompt_tokens','input_tokens'),output=count('completion_tokens','output_tokens'),total=count('total_tokens');
           if(input!==undefined)record.inputTokens=Math.max(record.inputTokens ?? 0,input);if(output!==undefined)record.outputTokens=Math.max(record.outputTokens ?? 0,output);
           const observed=total ?? (input!==undefined && output!==undefined?input+output:undefined);if(observed!==undefined)record.totalTokens=Math.max(record.totalTokens ?? 0,observed);
           if(input!==undefined || output!==undefined || observed!==undefined)record.usage='partial';
+          const reasoning = usage.completion_tokens_details?.reasoning_tokens ?? usage.output_tokens_details?.reasoning_tokens ?? usage.reasoning_tokens;
+          if (typeof reasoning === 'number' && Number.isFinite(reasoning) && reasoning >= 0) record.reasoningTokens = Math.max(record.reasoningTokens ?? 0, reasoning);
         };
         const request = new AbortController(); const stopRequest = () => request.abort(context.abort.signal.reason);
         context.abort.signal.addEventListener('abort', stopRequest, { once: true });if(context.abort.signal.aborted || res.destroyed)stopRequest();
@@ -77,13 +101,24 @@ export async function createServer(config: Config, options: { recover?: boolean;
         try {
           // Wait out rate limits (every 429) and transient provider/network failures (5xx or connection errors, 5 times) here
           // rather than hand them to OpenCode, whose own retries give up.
-          let upstream: Response | undefined, failures = 0;
+          let upstream: Response | undefined, failures = 0, capabilityRetried = false;
           for (let attempt = 0; ; attempt++) {
             let problem = ''; upstream = undefined;
             try {
               request.signal.throwIfAborted();record.attempts++;
               upstream = await (options.providerRequest || fetch)(target.href.replace(/\/$/, '') + '/chat/completions', { method: 'POST', headers: { authorization: `Bearer ${key}`, 'content-type': 'application/json' }, body: JSON.stringify(body), signal: request.signal });
               record.httpStatus=upstream.status;
+              if (!capabilityRetried && await rejectsReasoningBudget(upstream, body)) {
+                capabilityRetried = true;
+                const observedAt = new Date().toISOString(); unsupportedBudgets.set(capabilityKey, { observedAt });
+                delete body.reasoning_budget;
+                record.parameterOmissions = [{ parameter:'reasoning_budget',reason:'nvidia_v2_model_runner_unsupported',source:'provider_rejection',observedAt }];
+                record.answerReserve = 'unavailable'; record.settings = providerSettings(body); record.settingsSha256 = hash(record.settings);
+                await store.save(context.run);
+                await store.event(context.run, 'gateway', 'provider_capability_fallback', 'NVIDIA V2 runner rejected reasoning_budget; retrying once without it. Final-answer/tool-call reserve is unavailable.', {requestId:record.id,parameterOmissions:record.parameterOmissions,requestedSettings,requestedSettingsSha256:record.requestedSettingsSha256,settings:record.settings,settingsSha256:record.settingsSha256,answerReserve:record.answerReserve});
+                await upstream.body?.cancel().catch(() => {});
+                continue;
+              }
               if ([401, 403, 404].includes(upstream.status)) context.providerRejected = `HTTP ${upstream.status}`; // bad key or unknown model
               if (upstream.status === 429) problem = 'HTTP 429';
               else if (upstream.status >= 500 && ++failures <= 5) problem = `HTTP ${upstream.status}`;

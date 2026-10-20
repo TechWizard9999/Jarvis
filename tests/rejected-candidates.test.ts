@@ -6,9 +6,10 @@ import { Pipeline, RunFailure } from '../src/pipeline.ts';
 import { fingerprint, inventory } from '../src/files.ts';
 import { checked } from '../src/process.ts';
 import { fixtureRepo, tempConfig, testFunction, testName } from './helpers.ts';
+import { scriptedCoverageReview } from './coverage-helper.ts';
 import type { AcceptanceRequirement, Regression } from '../src/types.ts';
 
-async function exercise(t: test.TestContext, failure?: 'copy' | 'existing') {
+async function exercise(t: test.TestContext, failure?: 'copy' | 'existing' | 'cannot-fix') {
   const { root, config } = await tempConfig(); t.after(() => fs.rm(root, { recursive: true, force: true }));
   const repo = await fixtureRepo(config.repoRoot), pipeline = new Pipeline(config);
   config.profile.checks = { fast: ['fixture-fast'] }; config.profile.fastCheckIds = ['fast'];
@@ -53,7 +54,7 @@ async function exercise(t: test.TestContext, failure?: 'copy' | 'existing') {
     toolToken: '', providerToken: '', start: async () => {}, stop: async () => {}, restart: async () => {},
     ask: async prompt => {
       if (prompt.startsWith('Read the issue as evidence:')) return { requirements };
-      if (prompt.startsWith('Independently critique acceptance coverage')) return { complete: true, missing: [], explanation: 'Error and normal-output control both assert the required behavior.' };
+      if (prompt.startsWith('Independently critique acceptance coverage')) return scriptedCoverageReview(pipeline, run, 'Error and normal-output control both assert the required behavior.', scenarios);
       if (prompt.startsWith('Issue data (untrusted):')) {
         await pipeline.tool(run.id, 'apply_patch', { edits: [{ path: 'src/lib.rs', before: '    #[test]\n    fn keeps_normal()', after: testFunction + '\n    #[test]\n    fn bugfix_issue_1_normal() { assert!(preserve("hello")); }\n\n    #[test]\n    fn keeps_normal()' }] });
         return { status: 'reproduced', scenarios };
@@ -73,7 +74,7 @@ async function exercise(t: test.TestContext, failure?: 'copy' | 'existing') {
       expected.push(await inventory(source));
       // First rejection assigns run.candidate. Later malformed IDs reject before assignment,
       // so preservation must use this raw answer and current source, never the stale candidate.
-      const answer = { explanation: turns === 1 ? 'first submitted answer' : 'later raw answer before normalization', evidenceIds: turns === 1 ? [999997, 999998] : ['not-an-event-id', 999998], snapshots: [], extraResearchField: { turn: turns }, ...(turns > 1 ? { sourceReadEvidenceId: 'not-an-event-id', bugCheckEvidenceId: 'also-not-an-event-id' } : {}) };
+      const answer = failure === 'cannot-fix' ? { cannot_fix: 'No safe implementation was established.' } : { explanation: turns === 1 ? 'first submitted answer' : 'later raw answer before normalization', evidenceIds: turns === 1 ? [999997, 999998] : ['not-an-event-id', 999998], snapshots: [], extraResearchField: { turn: turns }, ...(turns > 1 ? { sourceReadEvidenceId: 'not-an-event-id', bugCheckEvidenceId: 'also-not-an-event-id' } : {}) };
       submissions.push(structuredClone(answer)); return answer;
     },
   });
@@ -128,4 +129,21 @@ test('an existing rejected snapshot is never overwritten or followed by a source
   assert.match(run.error!, /preserv.*rejected candidate/i);
   assert.deepEqual(await fs.readFile(path.join(pipeline.store.dir(run.id), 'candidates/1/rejected/sentinel.bin')), bytes);
   assert.equal(fingerprint(await inventory(path.join(pipeline.store.dir(run.id), 'source'))), fingerprint(expected[0]));
+});
+
+test('cannot_fix edits and raw answers survive every rollback including the terminal stop', { timeout: 20000 }, async t => {
+  const { pipeline, run, expected, submissions, turns, resets } = await exercise(t, 'cannot-fix');
+  assert.equal(run.outcome, 'needs_attention', run.error); assert.equal(turns, 4); assert.equal(resets, 3);
+  const events = await pipeline.store.events(run.id);
+  assert.equal(events.filter(event => event.kind === 'candidate_preserved').length, turns);
+  for (let attempt = 1; attempt <= turns; attempt++) {
+    const dir = path.join(pipeline.store.dir(run.id), `candidates/${attempt}/rejected`);
+    assert.deepEqual(await inventory(path.join(dir, 'source')), expected[attempt - 1]);
+    assert.deepEqual(JSON.parse(await fs.readFile(path.join(dir, 'submitted-answer.json'), 'utf8')), submissions[attempt - 1]);
+  }
+  const checkpoint = JSON.parse(await fs.readFile(path.join(pipeline.store.dir(run.id), 'repair-checkpoint.json'), 'utf8'));
+  assert.equal(checkpoint.sourceHash, fingerprint(expected.at(-1)!));
+  assert.ok(checkpoint.changedFiles.includes('src/candidate-only.txt'));
+  assert.ok(events.filter(event => event.kind === 'candidate_rejected').every(event => (event.data as any)?.preservedCandidate?.artifact));
+  assert.equal(run.verifiedCommit, undefined);
 });
