@@ -13,6 +13,8 @@ import { checked } from './process.ts';
 import { writeReport, prTitle } from './report.ts';
 import { candidateEvidenceChecks, normalizeCandidateEvidence, validateEvidence } from './evidence.ts';
 import { ProgressTracker, type VerificationVerdict, type ImmutableOffender } from './progress.ts';
+import { agentProviderFailure } from './agent-recovery.ts';
+import type { ProviderFailure } from './provider-health.ts';
 import { rustTests } from './rust.ts';
 import { coverageReviewPromptSchema, validateCoverageReview } from './coverage-review.ts';
 import { fetchCompetingPullRequests } from './competing.ts';
@@ -39,7 +41,7 @@ interface RecoveryDiagnosis {
   kind: 'tool-error' | 'check-result-loop'; tool: string; args: unknown; phase: AgentPhase; sourceHash: string; signature: string;
   error?: string; check?: { name: string; argv: string[]; status?: CheckResult['status']; exitCode: number; timedOut: boolean; outputHash: string; progressOutputHash?: string };
 }
-interface Context { run: Manifest; abort: AbortController; agent: RepairAgent; source: string; base: string; phase: AgentPhase; queue: Promise<unknown>; providerRejected?: string; toolFailures?: ProgressTracker; checkProgress?: ProgressTracker; lastCheckSignature?: string; recoveryProgress?: ProgressTracker; recoveryReason?: RecoveryDiagnosis; checkedRevisions?: Map<string,string>; verificationProgress?: ProgressTracker; guardFailures?: Record<string, { category: VerificationVerdict; sourceHash: string; reason: string; immutableOffenders: ImmutableOffender[] }>; validProof?: { sourceHash: string; evidenceIds: number[] }; }
+interface Context { run: Manifest; abort: AbortController; agent: RepairAgent; source: string; base: string; phase: AgentPhase; queue: Promise<unknown>; providerRejected?: string; providerFailure?: ProviderFailure; providerRecovery?: ProgressTracker; usableToolResults?: number; toolFailures?: ProgressTracker; checkProgress?: ProgressTracker; lastCheckSignature?: string; recoveryProgress?: ProgressTracker; recoveryReason?: RecoveryDiagnosis; checkedRevisions?: Map<string,string>; verificationProgress?: ProgressTracker; guardFailures?: Record<string, { category: VerificationVerdict; sourceHash: string; reason: string; immutableOffenders: ImmutableOffender[] }>; validProof?: { sourceHash: string; evidenceIds: number[] }; }
 export function validateInput(input: RunInput, profile: RepositoryProfile = defaultProfile): RunInput {
   if (!input || typeof input.repo !== 'string' || !path.isAbsolute(input.repo)) throw new Error('Provide an absolute repository path');
   const issue = new URL(input.issue);
@@ -504,21 +506,32 @@ export class Pipeline {
     }
   }
   private async revertCandidate(context: Context, frozenSource: string) { await this.resetSource(context.source, frozenSource, context.abort.signal); await this.repository.mirror(context.run, context.source, context.abort.signal); }
-  // Retries an agent turn until it yields an answer or the run is cancelled. Each failure (network, OpenCode or provider
-  // error, stall, unparsable reply) interrupts the turn; every third consecutive failure restarts OpenCode with a fresh
-  // session. A rejected credential or three identical recovery checkpoints on unchanged source stop the run.
+  // Productive work has no total turn budget. Repeated provider failures without usable output stop separately
+  // from repository diagnoses; restarting OpenCode cannot repair provider credentials or a failed generation stream.
   private async askAgent(context: Context, prompt: string, valid: (answer: any) => boolean): Promise<any> {
     for (let failure = 1; ; failure++) {
       try {
         const answer = await context.agent.ask(prompt, context.abort.signal, valid, context.phase);
         // A valid phase answer proceeds to controller validation, even if a diagnosis was just scheduled.
         // Clearing the pending diagnosis also prevents its deferred interrupt from affecting the next phase.
-        context.recoveryReason = undefined; context.toolFailures = undefined; context.checkProgress = undefined; context.recoveryProgress = undefined;
+        context.recoveryReason = undefined; context.toolFailures = undefined; context.checkProgress = undefined; context.recoveryProgress = undefined; context.providerRecovery = undefined;
         return answer;
       } catch (e) {
         if (context.abort.signal.aborted) throw e;
         if (e instanceof RunFailure) throw e;
         if (context.providerRejected) throw new RunFailure('environment_blocked', `The model provider rejected the request (${context.providerRejected}): check .secrets/nvidia_api_key and BUGFIX_MODEL`);
+        const providerFailure = context.providerFailure, fallback = agentProviderFailure(e);
+        if (providerFailure || fallback) {
+          const sourceHash = fingerprint(await inventory(context.source, context.abort.signal));
+          const signature = providerFailure ? JSON.stringify([providerFailure.kind, providerFailure.code, providerFailure.type]) : fallback!.signature;
+          const repeated = (context.providerRecovery ||= new ProgressTracker()).record(sourceHash, { kind: 'agent-recovery', phase: context.phase, signature: JSON.stringify([signature, context.usableToolResults || 0]) });
+          const partial = providerFailure?.meaningfulOutput === true;
+          const stalled = partial || providerFailure?.circuitOpen === true || providerFailure?.retryable === false || repeated;
+          await this.store.event(context.run, 'controller', 'provider_checkpoint', 'Checking provider recovery before another agent turn', { phase: context.phase, sourceHash, stalled, ...(providerFailure ? providerFailure : { kind: 'provider_error', message: fallback!.message }), usableToolResults: context.usableToolResults || 0 });
+          if (stalled) throw new RunFailure(partial ? 'needs_attention' : 'environment_blocked', partial
+            ? 'The model stream failed after delivering partial output. Evidence and repository work are preserved; inspect the provider checkpoint before starting another turn.'
+            : `The model provider cannot complete a generation${providerFailure ? ` (${providerFailure.kind}; ${providerFailure.consecutiveFailures} consecutive failures)` : ' after 3 unchanged failures without usable tool progress'}. Evidence and repository work are preserved; check the provider checkpoint before retrying.`);
+        }
         const diagnosis = context.recoveryReason; context.recoveryReason = undefined;
         if (diagnosis) {
           const sourceHash = fingerprint(await inventory(context.source, context.abort.signal));
@@ -642,6 +655,7 @@ export class Pipeline {
         if ((context.checkProgress ||= new ProgressTracker()).record(sourceHash, { kind: 'check-result-loop', phase: context.phase, signature })) diagnosis = { kind: 'check-result-loop', tool: name, args: requestedArgs, phase: context.phase, sourceHash, signature, check: summary };
       } else throw new Error('Unknown controller tool');
       const event = await this.store.event(run, 'tool', 'result', name, { tool: name, call: called.seq, result });
+      context.usableToolResults = (context.usableToolResults || 0) + 1;
       if (diagnosis) await this.diagnose(context, diagnosis);
       return { evidenceId: event.seq, result };
     } catch (error) {

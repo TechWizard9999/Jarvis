@@ -12,11 +12,15 @@ import { original } from '../tests/helpers.ts';
 const root=path.join(process.cwd(),'state','adapter-integration',randomBytes(5).toString('hex'));
 const config=loadConfig({...process.env,BUGFIX_PROJECT_DIR:process.cwd(),BUGFIX_STATE_DIR:root,BUGFIX_REPO_ROOT:path.join(root,'repos'),BUGFIX_MODEL:'nim/nvidia/nemotron-3-ultra-550b-a55b',BUGFIX_BIND:'0.0.0.0',BUGFIX_NVIDIA_SECRET:path.join(root,'fixture-provider-key')});
 await fs.mkdir(root,{recursive:true});await fs.writeFile(config.nvidiaSecret,'fixture-not-a-real-nvidia-key');
-let requests=0, activeCase='discovery';
+let requests=0, activeCase='discovery', streamErrorAttempts=0;
 const observed: {case:string;phase:string;tools:string[];schemaArrayOnly?:boolean;maxTokens:number;reasoningBudget?:number;reasoningEffort?:string;thinking:boolean}[]=[];
 const fakeProvider: typeof fetch = async (_url,init)=>{
   requests++;const body=JSON.parse(String(init?.body));const names=(body.tools||[]).map((t:any)=>t.function.name);
   assert.ok(names.every((name:string)=>name.startsWith('bugfix_')),'Native tool leaked into outbound payload');
+  if(activeCase==='stream-error'){
+    streamErrorAttempts++;
+    return new Response('data: {"error":{"code":500,"type":"server_error","message":"Internal server error"}}\n\ndata: [DONE]\n\n',{status:200,headers:{'content-type':'text/event-stream'}});
+  }
   const system=body.messages.filter((message:any)=>message.role==='system').map((message:any)=>typeof message.content==='string'?message.content:JSON.stringify(message.content)).join('\n');
   const phase=/Current phase: (discovery|review|reproduction|patching|format|locked)/.exec(system)?.[1];
   if(phase){
@@ -78,11 +82,22 @@ try{
   await assert.rejects(app.pipeline.tool(run.id,'run_check',{check:'format-source'}),/Checks are disabled/);
   await assert.rejects(app.pipeline.tool(run.id,'replace_source',{path:'src/lib.rs',before:original,after:'must not write'}),/Edits are unavailable/);
   assert.equal(await fs.readFile(path.join(source,'src/lib.rs'),'utf8'),original);
+  // Exercise the actual SDK retry path: an embedded error must never become a
+  // successful generation, and the SDK must not keep sending upstream attempts.
+  activeCase='stream-error';app.pipeline.contexts.get(run.id)!.phase='reproduction';
+  const beforeErrors=run.modelRequests?.length||0;
+  await assert.rejects(agent.ask('STREAM_ERROR_REGRESSION: Return exactly {"adapter":"ok"}.',AbortSignal.timeout(90000),answer=>answer.adapter==='ok','reproduction'),/OpenCode\/model error|provider|HTTP 409/i);
+  assert.equal(streamErrorAttempts,3,'Repeated provider failures must open the circuit after three actual attempts');
+  const failed=run.modelRequests!.slice(beforeErrors) as any[];
+  assert.equal(failed.filter(record=>record.attempts>0).length,3);
+  assert.ok(failed.filter(record=>record.attempts>0).every(record=>record.status==='failed'&&record.httpStatus===200&&record.providerError?.code===500&&record.semanticComplete===false),'HTTP 200 error streams must be recorded as semantic failures');
+  assert.equal((app.pipeline.contexts.get(run.id) as any).providerFailure?.circuitOpen,true);
   const events=await app.store.events(run.id);assert.ok(events.some(e=>e.kind==='result'&&(e.data as any)?.tool==='read_source'));
   assert.ok(events.some(e=>e.kind==='model_request'));
   assert.equal(events.filter(event=>event.kind==='format_retry').length,1);
-  await atomicJson(path.join(process.cwd(),'state','adapter-results.json'),{testedAt:new Date().toISOString(),outcome:'passed',provider:'local scripted SSE (no NVIDIA calls)',opencodeImage:await app.pipeline.docker.imageId(config.agentImage),requests,toolReadExecuted:true,phaseContracts:observed,backendReviewGuards:true});
-  console.log('PASS: real OpenCode phase-specific system/tools, array-only outbound patch schema, read bridge, disabled format-only retry, backend review guards and final JSON.');
+  assert.ok(!events.some(event=>event.kind==='model_finished'&&failed.some(record=>record.id===(event.data as any)?.requestId)),'Failed error streams must not emit model_finished');
+  await atomicJson(path.join(process.cwd(),'state','adapter-results.json'),{testedAt:new Date().toISOString(),outcome:'passed',provider:'local scripted SSE (no NVIDIA calls)',opencodeImage:await app.pipeline.docker.imageId(config.agentImage),requests,toolReadExecuted:true,phaseContracts:observed,backendReviewGuards:true,embeddedStreamErrors:{attempts:streamErrorAttempts,circuitOpen:true,allFailed:true}});
+  console.log('PASS: real OpenCode phase-specific tools, read bridge, disabled format retry, backend review guards, and embedded-stream-error circuit breaker.');
 }finally{
   await agent.stop();await app.pipeline.docker.cleanup(run);app.pipeline.contexts.delete(run.id);app.server.closeAllConnections();await new Promise<void>(resolve=>app.server.close(()=>resolve()));
 }

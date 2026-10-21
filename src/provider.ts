@@ -11,10 +11,12 @@ export type ModelTurnPurpose = 'discovery' | 'reproduction' | 'review' | 'patchi
 const ultra = 'nvidia/nemotron-3-ultra-550b-a55b';
 const lightning = 'nvidia/nemotron-3.5-lightning-30b-a3b';
 /** Only this observed NVIDIA runner error permits omitting a configured request parameter. */
-export async function rejectsReasoningBudget(response: Response, body: Record<string, any>): Promise<boolean> {
-  if (response.status !== 400 || ![ultra, lightning].includes(body.model) || typeof body.reasoning_budget !== 'number') return false;
-  const value: any = await response.clone().json().catch(() => undefined);
+export function rejectsReasoningBudgetError(value: any, status: number, body: Record<string, any>): boolean {
+  if (![200,400].includes(status) || ![ultra, lightning].includes(body.model) || typeof body.reasoning_budget !== 'number') return false;
   return value?.error?.message === 'ValueError: thinking_token_budget is not yet supported by the V2 model runner. Run vLLM with VLLM_USE_V2_MODEL_RUNNER=0 to use thinking_token_budget.';
+}
+export async function rejectsReasoningBudget(response: Response, body: Record<string, any>): Promise<boolean> {
+  return rejectsReasoningBudgetError(await response.clone().json().catch(() => undefined), response.status, body);
 }
 /** Explicit controller policy. Purpose is supplied by the trusted turn, never read from the request body. */
 export function providerBody(input: Record<string,any>, config: Config, purpose: ModelTurnPurpose = 'reproduction'): Record<string,any> {

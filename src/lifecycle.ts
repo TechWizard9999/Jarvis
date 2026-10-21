@@ -45,7 +45,7 @@ export function captureRunConfiguration(config: Config) {
     modelContext: config.modelContext, modelInput: config.modelInput, modelMaxOutput: config.modelMaxOutput,
     compactionReserved: config.compactionReserved, compaction: { auto: true, prune: true, reserved: config.compactionReserved },
     allowUnverifiedContext: config.allowUnverifiedContext, allowUnboundedReasoning: config.allowUnboundedReasoning,
-    reasoningBudgetPolicy: { support: 'endpoint_dependent', unsupportedFallback: 'exact_nvidia_v2_error_once', capabilityCache: 'controller_lifetime_endpoint_model', answerReserve: 'conditional_on_supported_reasoning_budget' },
+    reasoningBudgetPolicy: { support: 'endpoint_dependent', unsupportedFallback: 'exact_nvidia_v2_error_once', capabilityCache: 'durable_exact_endpoint_model_until_revalidation', answerReserve: 'conditional_on_supported_reasoning_budget' },
     rustToolchain: config.rustToolchain,
     workerImage: config.workerImage, agentImage: config.agentImage, publisherImage: config.publisherImage,
     commandTimeoutMs: config.commandTimeoutMs, maxAttempts: config.maxAttempts, memory: config.memory, cpus: config.cpus,

@@ -5,9 +5,9 @@ import path from 'node:path';
 import { createServer } from '../src/server.ts';
 import { tempConfig } from './helpers.ts';
 
-test('model gateway retries 429s until answered, retries 5xx five times, and reports only answered usage', async t => {
+test('model gateway bounds consecutive transient recovery to four attempts and reports only answered usage', async t => {
   const {root,config}=await tempConfig();await fs.mkdir(path.dirname(config.nvidiaSecret),{recursive:true});await fs.writeFile(config.nvidiaSecret,'test-key');
-  const statuses=[429,200,429,429,429,429,429,200,500,500,500,500,500,500];let calls=0;
+  const statuses=[429,200,429,429,429,200,500,500,500,500];let calls=0;
   const providerRequest=(async()=>{const status=statuses[calls++];return new Response(status===200?JSON.stringify({choices:[],usage:{total_tokens:42}}):JSON.stringify({status}),{status,headers:{'content-type':'application/json','retry-after':'0'}});}) as unknown as typeof fetch;
   const app=await createServer(config,{recover:false,providerRequest});await new Promise<void>(resolve=>app.server.listen(0,'127.0.0.1',resolve));
   t.after(async()=>{app.server.closeAllConnections();await new Promise<void>(resolve=>app.server.close(()=>resolve()));await fs.rm(root,{recursive:true,force:true});});
@@ -15,8 +15,9 @@ test('model gateway retries 429s until answered, retries 5xx five times, and rep
   app.pipeline.contexts.set(run.id,{run,abort:new AbortController(),agent:{providerToken:'gw'},phase:'reproduction',queue:Promise.resolve()} as any);
   const ask=()=>fetch(`http://127.0.0.1:${(app.server.address() as {port:number}).port}/provider/${run.id}/v1/chat/completions`,{method:'POST',headers:{authorization:'Bearer gw','content-type':'application/json'},body:JSON.stringify({model:'fixture-model',messages:[{role:'user',content:'hi'}]})});
   const ok=await ask();assert.equal(ok.status,200);await ok.text();assert.equal(calls,2);assert.equal(run.tokens,42);
-  const retried=await ask();assert.equal(retried.status,200);await retried.text();assert.equal(calls,8);assert.equal(run.tokens,84);
-  const failed=await ask();assert.equal(failed.status,500);await failed.text();assert.equal(calls,14);assert.equal(run.tokens,84);
+  const retried=await ask();assert.equal(retried.status,200);await retried.text();assert.equal(calls,6);assert.equal(run.tokens,84);
+  const failed=await ask();assert.equal(failed.status,500);await failed.text();assert.equal(calls,10);assert.equal(run.tokens,84);
+  assert.equal(run.modelRequests?.[2].attemptRecords?.length,4);assert.equal(run.modelRequests?.[2].providerError?.kind,'provider_error');
 });
 
 test('dashboard requires authentication, blocks cross-origin writes and serves a labelled demo', async t => {
@@ -72,8 +73,7 @@ test('interrupted model responses retain partial usage rather than reporting an 
   const app=await createServer(config,{recover:false,providerRequest});await new Promise<void>(resolve=>app.server.listen(0,'127.0.0.1',resolve));
   t.after(async()=>{app.server.closeAllConnections();await new Promise<void>(resolve=>app.server.close(()=>resolve()));await fs.rm(root,{recursive:true,force:true});});
   const run=await app.store.create({repo:'/repo',issue:'https://github.com/rtk-ai/rtk/issues/1'});app.pipeline.contexts.set(run.id,{run,abort:new AbortController(),agent:{providerToken:'gw'},phase:'reproduction',queue:Promise.resolve()} as any);
-  const response=await fetch(`http://127.0.0.1:${(app.server.address() as {port:number}).port}/provider/${run.id}/v1/chat/completions`,{method:'POST',headers:{authorization:'Bearer gw','content-type':'application/json'},body:JSON.stringify({model:'fixture-model',messages:[]})});
-  await assert.rejects(response.text());await new Promise(resolve=>setTimeout(resolve,30));
+  await assert.rejects(async()=>{const response=await fetch(`http://127.0.0.1:${(app.server.address() as {port:number}).port}/provider/${run.id}/v1/chat/completions`,{method:'POST',headers:{authorization:'Bearer gw','content-type':'application/json'},body:JSON.stringify({model:'fixture-model',messages:[]})});await response.text();});await new Promise(resolve=>setTimeout(resolve,30));
   const record=run.modelRequests?.[0];assert.equal(record?.usage,'partial');assert.equal(record?.totalTokens,14);assert.equal(record?.status,'interrupted');assert.equal(run.tokens,14);
 });
 

@@ -1,18 +1,20 @@
-import { providerBody, providerRetrySeconds, rejectsReasoningBudget, type ModelTurnPurpose } from './provider.ts';
-import { setTimeout as sleep } from 'node:timers/promises';
+import { providerBody, providerRetrySeconds, rejectsReasoningBudgetError, type ModelTurnPurpose } from './provider.ts';
 import http from 'node:http';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { randomBytes, timingSafeEqual, createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { Pipeline } from './pipeline.ts';
-import { Store } from './store.ts';
+import { Store, atomicJson } from './store.ts';
+import { providerFrames, frameError, frameOutput } from './provider-stream.ts';
+import { ProviderCooldown, providerError, interruptedProviderError, recordProviderFailure, providerAttemptHeaders, type ProviderError, type ProviderAttemptRecord } from './provider-health.ts';
 import { demo } from './demo.ts';
 import { doctor } from './doctor.ts';
 import { filterProviderTools } from './agent.ts';
 import { safeRelative, sourcePath } from './files.ts';
 import type { Config, RunEvent, Manifest } from './types.ts';
 
+const hashProviderIdentity = (endpoint: string, key: string) => createHash('sha256').update(JSON.stringify([endpoint.replace(/\/$/, ''),key])).digest('hex');
 const publicDir = fileURLToPath(new URL('../public/', import.meta.url));
 const equal = (a: string, b: string) => { const x = Buffer.from(a), y = Buffer.from(b); return x.length === y.length && timingSafeEqual(x, y); };
 function providerSettings(body: Record<string, any>): Record<string, unknown> {
@@ -34,8 +36,19 @@ export async function createServer(config: Config, options: { recover?: boolean;
   const uiToken = (await fs.readFile(tokenFile, 'utf8').catch(() => '')).trim() || randomBytes(32).toString('hex');
   await fs.writeFile(tokenFile, uiToken, { mode: 0o600 });
   const store = new Store(config.stateDir); const pipeline = new Pipeline(config, store);
-  // An observed capability is scoped to this controller lifetime and exact configured endpoint/model.
-  const unsupportedBudgets = new Map<string, { observedAt: string }>();
+  // Only a validated exact rejection changes capability; cache survives a controller restart.
+  const capabilityFile = path.join(config.stateDir, 'provider-capabilities.json');
+  const unsupportedBudgets = new Map<string, { observedAt: string; endpoint: string; model: string }>();
+  const capabilityKeyFor = (endpoint: string, model: string) => JSON.stringify([endpoint.replace(/\/$/, ''),model]);
+  const cachedFile = await fs.stat(capabilityFile).catch(() => undefined);
+  if(cachedFile && cachedFile.size <= 64_000) {
+    const cached = await fs.readFile(capabilityFile,'utf8').then(JSON.parse).catch(() => undefined);
+    if(cached?.version === 1 && Array.isArray(cached.entries) && cached.entries.length <= 100) for(const entry of cached.entries) {
+      if(!entry || entry.reason !== 'nvidia_v2_model_runner_unsupported' || typeof entry.endpoint !== 'string' || !['nvidia/nemotron-3-ultra-550b-a55b','nvidia/nemotron-3.5-lightning-30b-a3b'].includes(entry.model) || typeof entry.observedAt !== 'string' || !/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z$/.test(entry.observedAt) || !Number.isFinite(Date.parse(entry.observedAt)))continue;
+      try {const endpoint=new URL(entry.endpoint);if(endpoint.protocol !== 'https:' || endpoint.username || endpoint.password || endpoint.search || endpoint.hash)continue;unsupportedBudgets.set(capabilityKeyFor(endpoint.href,entry.model),{endpoint:endpoint.href,model:entry.model,observedAt:entry.observedAt});}catch {}
+    }
+  }
+  const cooldown = new ProviderCooldown();
   if (options.recover !== false) await pipeline.recover();
   const json = (res: http.ServerResponse, data: unknown, code = 200) => { if(res.destroyed || res.writableEnded)return;res.writeHead(code, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' }); res.end(JSON.stringify(data)); };
   const server = http.createServer(async (req, res) => {
@@ -61,6 +74,7 @@ export async function createServer(config: Config, options: { recover?: boolean;
         const input = await jsonBody(req, bodyLimit); const filtered = filterProviderTools(context.run, input);
         const expectedModel = config.model.slice(config.model.indexOf('/') + 1);
         if (input.model !== expectedModel) return json(res, { error: 'Model ID does not match the recorded configuration' }, 400);
+        if(context.providerFailure?.circuitOpen) return json(res,{error:{type:'provider_recovery_paused',message:'Model provider recovery paused after repeated failures or partial output. Evidence is preserved; inspect provider health before a new run.',code:'provider_recovery_paused'}},409);
         const key = (await fs.readFile(config.nvidiaSecret, 'utf8')).trim();
         if (!key || /\s/.test(key)) throw new Error('NVIDIA secret file is empty or invalid');
         // Per-request output is capped at the model's configured limit; total usage is only reported, never capped.
@@ -70,7 +84,8 @@ export async function createServer(config: Config, options: { recover?: boolean;
         const target = new URL(config.providerBaseUrl.endsWith('/') ? config.providerBaseUrl : config.providerBaseUrl + '/');
         if (target.protocol !== 'https:' || target.username || target.password) throw new Error('The NVIDIA endpoint must be a credential-free HTTPS URL');
         const requestedSettings = providerSettings(body);
-        const capabilityKey = JSON.stringify([target.href, body.model]);
+        const capabilityKey = capabilityKeyFor(target.href, body.model);
+        const cooldownKey = hashProviderIdentity(target.href, key);
         const cachedBudget = typeof body.reasoning_budget === 'number' ? unsupportedBudgets.get(capabilityKey) : undefined;
         if (cachedBudget) delete body.reasoning_budget;
         const settings = providerSettings(body);
@@ -81,8 +96,8 @@ export async function createServer(config: Config, options: { recover?: boolean;
         if (cachedBudget) record.parameterOmissions = [{ parameter:'reasoning_budget',reason:'nvidia_v2_model_runner_unsupported',source:'cached_provider_rejection',observedAt:cachedBudget.observedAt }];
         (context.run.modelRequests ||= []).push(record); await store.save(context.run);
         await store.event(context.run, 'gateway', 'model_request', 'Approved outbound model tool list', {requestId:record.id,tools:filtered.names,removedTools:filtered.removed,model:input.model,turnPurpose,turnPurposeSource,internalPurpose:record.internalPurpose,contextLimits,settings,settingsSha256:record.settingsSha256,requestedSettings,requestedSettingsSha256:record.requestedSettingsSha256,parameterOmissions:record.parameterOmissions,answerReserve:record.answerReserve,promptSha256:record.promptSha256});
-        // One request lives until the run is cancelled or the agent disconnects (OpenCode then sends a new request).
-        let completed = false, interrupted = false;
+        let completed = false, interrupted = false, meaningfulOutput = false, usableOutput = false;
+        record.transportComplete = false; record.semanticComplete = false; record.outputDelivered = false; record.attemptRecords = [];
         const readUsage = (data: any) => {
           const finish = Array.isArray(data?.choices) ? data.choices.find((choice: any) => typeof choice?.finish_reason === 'string')?.finish_reason : undefined;
           if (finish !== undefined) record.finishReason = finish;
@@ -95,73 +110,105 @@ export async function createServer(config: Config, options: { recover?: boolean;
           const reasoning = usage.completion_tokens_details?.reasoning_tokens ?? usage.output_tokens_details?.reasoning_tokens ?? usage.reasoning_tokens;
           if (typeof reasoning === 'number' && Number.isFinite(reasoning) && reasoning >= 0) record.reasoningTokens = Math.max(record.reasoningTokens ?? 0, reasoning);
         };
+        const failure = (error: ProviderError) => {
+          const value=recordProviderFailure(context.providerFailure,error,{requestId:record.id,httpStatus:record.httpStatus,meaningfulOutput,usableOutput,identity:JSON.stringify([capabilityKey,record.settingsSha256])});
+          context.providerFailure=value;record.providerError=value;return value;
+        };
         const request = new AbortController(); const stopRequest = () => request.abort(context.abort.signal.reason);
         context.abort.signal.addEventListener('abort', stopRequest, { once: true });if(context.abort.signal.aborted || res.destroyed)stopRequest();
         res.on('close', () => { if (!res.writableEnded) request.abort(new Error('Agent disconnected from the model gateway')); });
+        const omitBudget = async () => {
+          const observedAt = new Date().toISOString();unsupportedBudgets.set(capabilityKey,{observedAt,endpoint:target.href,model:body.model});
+          await atomicJson(capabilityFile,{version:1,entries:[...unsupportedBudgets.values()].map(value=>({...value,reason:'nvidia_v2_model_runner_unsupported'}))});
+          delete body.reasoning_budget;
+          record.parameterOmissions = [{parameter:'reasoning_budget',reason:'nvidia_v2_model_runner_unsupported',source:'provider_rejection',observedAt}];
+          record.answerReserve='unavailable';record.settings=providerSettings(body);record.settingsSha256=hash(record.settings);
+          await store.save(context.run);
+          await store.event(context.run,'gateway','provider_capability_fallback','NVIDIA V2 runner rejected reasoning_budget; retrying once without it. Final-answer/tool-call reserve is unavailable.',{requestId:record.id,parameterOmissions:record.parameterOmissions,requestedSettings,requestedSettingsSha256:record.requestedSettingsSha256,settings:record.settings,settingsSha256:record.settingsSha256,answerReserve:record.answerReserve});
+        };
+        const errorResponse = (error: ProviderError) => {
+          const value={error:{message:error.message,type:error.type || error.kind,code:error.code ?? error.kind}};
+          if(res.headersSent){res.write(`event: error\ndata: ${JSON.stringify(value)}\n\n`);return res.end();}
+          return json(res,value,record.httpStatus && record.httpStatus>=400 ? record.httpStatus : 502);
+        };
         try {
-          // Wait out rate limits (every 429) and transient provider/network failures (5xx or connection errors, 5 times) here
-          // rather than hand them to OpenCode, whose own retries give up.
-          let upstream: Response | undefined, failures = 0, capabilityRetried = false;
-          for (let attempt = 0; ; attempt++) {
-            let problem = ''; upstream = undefined;
+          let transientFailures=0,capabilityRetried=false;
+          for (;;) {
+            await cooldown.wait(cooldownKey,request.signal);request.signal.throwIfAborted();
+            const startedAt=new Date().toISOString();record.attempts++;
+            let upstream: Response;
+            let attempt: ProviderAttemptRecord={attempt:record.attempts,startedAt,finishedAt:startedAt,latencyMs:0,retryOwner:'gateway'};
+            const finishAttempt=()=>{attempt.finishedAt=new Date().toISOString();attempt.latencyMs=Math.max(0,Date.parse(attempt.finishedAt)-Date.parse(attempt.startedAt));};
+            record.attemptRecords.push(attempt);
             try {
-              request.signal.throwIfAborted();record.attempts++;
-              upstream = await (options.providerRequest || fetch)(target.href.replace(/\/$/, '') + '/chat/completions', { method: 'POST', headers: { authorization: `Bearer ${key}`, 'content-type': 'application/json' }, body: JSON.stringify(body), signal: request.signal });
-              record.httpStatus=upstream.status;
-              if (!capabilityRetried && await rejectsReasoningBudget(upstream, body)) {
-                capabilityRetried = true;
-                const observedAt = new Date().toISOString(); unsupportedBudgets.set(capabilityKey, { observedAt });
-                delete body.reasoning_budget;
-                record.parameterOmissions = [{ parameter:'reasoning_budget',reason:'nvidia_v2_model_runner_unsupported',source:'provider_rejection',observedAt }];
-                record.answerReserve = 'unavailable'; record.settings = providerSettings(body); record.settingsSha256 = hash(record.settings);
-                await store.save(context.run);
-                await store.event(context.run, 'gateway', 'provider_capability_fallback', 'NVIDIA V2 runner rejected reasoning_budget; retrying once without it. Final-answer/tool-call reserve is unavailable.', {requestId:record.id,parameterOmissions:record.parameterOmissions,requestedSettings,requestedSettingsSha256:record.requestedSettingsSha256,settings:record.settings,settingsSha256:record.settingsSha256,answerReserve:record.answerReserve});
-                await upstream.body?.cancel().catch(() => {});
-                continue;
-              }
-              if ([401, 403, 404].includes(upstream.status)) context.providerRejected = `HTTP ${upstream.status}`; // bad key or unknown model
-              if (upstream.status === 429) problem = 'HTTP 429';
-              else if (upstream.status >= 500 && ++failures <= 5) problem = `HTTP ${upstream.status}`;
-              else break;
-              await upstream.body?.cancel().catch(() => {});
-            } catch (error) {
-              if (request.signal.aborted || ++failures > 5) return res.headersSent ? res.destroy() : json(res, { error: `Model provider unreachable: ${String(error)}` }, 502);
-              problem = String(error);
+              upstream=await (options.providerRequest || fetch)(target.href.replace(/\/$/,'')+'/chat/completions',{method:'POST',headers:{authorization:`Bearer ${key}`,'content-type':'application/json'},body:JSON.stringify(body),signal:request.signal});
+              record.httpStatus=upstream.status;attempt.httpStatus=upstream.status;Object.assign(attempt,providerAttemptHeaders(upstream.headers,key));
+            } catch {
+              finishAttempt();if(request.signal.aborted)throw request.signal.reason;
+              const error:ProviderError={kind:'provider_error',type:'network_error',message:'Model provider connection failed.',retryable:true};
+              if(++transientFailures>=4){attempt.error=failure(error);return errorResponse(error);}
+              const seconds=providerRetrySeconds(undefined,transientFailures-1);attempt.retryAfterSeconds=seconds;cooldown.defer(cooldownKey,seconds);
+              await store.event(context.run,'gateway','provider_retry',`Model connection failed; retrying in ${seconds}s`,{requestId:record.id,attempt:attempt.attempt,retryOwner:'gateway',seconds});continue;
             }
-            const seconds = providerRetrySeconds(upstream?.headers,attempt);
-            await store.event(context.run, 'gateway', problem === 'HTTP 429' ? 'rate_limited' : 'provider_retry', `Model ${problem}; retrying in ${seconds}s`);
-            await sleep(seconds * 1000, undefined, { signal: request.signal });
-          }
-          if(res.destroyed || res.writableEnded || request.signal.aborted)return;
-          res.writeHead(upstream.status, { 'content-type': upstream.headers.get('content-type') || 'application/json', 'cache-control': 'no-store' });
-          if (!upstream.body) {completed=true;return res.end();}
-          let buffer = ''; const decoder = new TextDecoder();
-          try {
-            for await (const chunk of upstream.body) {
-              if(res.destroyed || res.writableEnded || request.signal.aborted)throw new Error('Model response disconnected');
-              res.write(chunk); buffer += decoder.decode(chunk, { stream: true });
-              let index: number;
-              while ((index = buffer.indexOf('\n')) >= 0) {
-                const line = buffer.slice(0, index).replace(/^data:\s*/, '').trim(); buffer = buffer.slice(index + 1);
-                try {readUsage(JSON.parse(line));}catch {}
+            if([401,403,404].includes(upstream.status))context.providerRejected=`HTTP ${upstream.status}`;
+            if(upstream.status===429 || upstream.status>=500) {
+              if(++transientFailures<4) {
+                finishAttempt();const seconds=providerRetrySeconds(upstream.headers,transientFailures-1);attempt.retryAfterSeconds=seconds;cooldown.defer(cooldownKey,seconds);
+                await upstream.body?.cancel().catch(()=>{});
+                await store.event(context.run,'gateway',upstream.status===429?'rate_limited':'provider_retry',`Model HTTP ${upstream.status}; retrying in ${seconds}s`,{requestId:record.id,attempt:attempt.attempt,retryOwner:'gateway',seconds,httpStatus:upstream.status,...providerAttemptHeaders(upstream.headers,key)});continue;
               }
-              if (buffer.length > 1_000_000) buffer = buffer.slice(-100000);
+              // Preserve the final Retry-After across the SDK's next logical request too.
+              cooldown.defer(cooldownKey,providerRetrySeconds(upstream.headers,transientFailures-1));
             }
-          } catch (error) {
-            // A broken stream must reach OpenCode as a transport error, not as a silently truncated (retry-less) answer.
-            interrupted=true;
-            await store.event(context.run, 'gateway', 'model_error', `Model stream interrupted: ${String(error)}`); return res.destroy();
+            const sse=/text\/event-stream/i.test(upstream.headers.get('content-type') || '');
+            let pending='',terminal=false,fallback=false,protocolDone=false;
+            try {
+              for await(const frame of providerFrames(upstream)) {
+                if(res.destroyed || res.writableEnded || request.signal.aborted)throw new Error('Model response disconnected');
+                readUsage(frame.data);
+                const error=frameError(frame,upstream.status);
+                if(error) {
+                  if(!capabilityRetried && !meaningfulOutput && rejectsReasoningBudgetError(frame.data,upstream.status,body)) {
+                    finishAttempt();capabilityRetried=true;await omitBudget();fallback=true;break;
+                  }
+                  if(!sse)record.transportComplete=true;
+                  finishAttempt();attempt.error=failure(error);return errorResponse(error);
+                }
+                const output=frameOutput(frame.data);meaningfulOutput ||= output.meaningful;usableOutput ||= output.usable;
+                if(frame.done && !meaningfulOutput && !terminal) {
+                  finishAttempt();const error:ProviderError={kind:'provider_error',type:'empty_generation',message:'Model provider ended the stream without a generation.',retryable:true};attempt.error=failure(error);return errorResponse(error);
+                }
+                terminal ||= !!frame.done || output.finish;
+                pending+=frame.text;
+                if(pending.length>4_000_000)throw new Error('Provider prelude exceeded the supported size');
+                if(meaningfulOutput || !sse) {
+                  if(!res.headersSent)res.writeHead(upstream.status,{'content-type':upstream.headers.get('content-type') || 'application/json','cache-control':'no-store'});
+                  record.outputDelivered ||= meaningfulOutput;res.write(pending);pending='';
+                }
+                if(frame.done){protocolDone=true;break;}
+              }
+              if(fallback)continue;
+              record.transportComplete=!protocolDone;finishAttempt();
+              if(sse && !terminal) {interrupted=true;const error=interruptedProviderError();attempt.error=failure(error);return res.destroy();}
+              if(upstream.status>=400) {const error=providerError(undefined,upstream.status)!;attempt.error=failure(error);return errorResponse(error);}
+              record.semanticComplete=true;completed=true;
+              if(usableOutput)context.providerFailure=undefined;
+              if(!res.headersSent)res.writeHead(upstream.status,{'content-type':upstream.headers.get('content-type') || 'application/json','cache-control':'no-store'});
+              return res.end(pending);
+            } catch {
+              finishAttempt();interrupted=true;
+              if(!request.signal.aborted)attempt.error=failure(interruptedProviderError());
+              return res.destroy();
+            }
           }
-          try {readUsage(JSON.parse(buffer));}catch {}
-          completed=true;return res.end();
         } finally {
           context.abort.signal.removeEventListener('abort', stopRequest);
           record.finishedAt=new Date().toISOString();record.latencyMs=Math.max(0,Date.parse(record.finishedAt)-Date.parse(record.startedAt));
-          record.status=completed?(record.httpStatus && record.httpStatus>=400?'failed':'completed'):interrupted || request.signal.aborted?'interrupted':'failed';
+          record.status=completed?'completed':interrupted || request.signal.aborted?'interrupted':'failed';
           if(completed && record.totalTokens!==undefined)record.usage='complete';
           context.run.tokens+=record.totalTokens ?? 0;
           await store.save(context.run);
-          await store.event(context.run,'gateway',record.status==='completed'?'model_finished':'model_error',`Model ${record.httpStatus?`HTTP ${record.httpStatus}`:record.status}; reported tokens ${record.totalTokens ?? 'unknown'} (${record.usage})`,{requestId:record.id,...record});
+          await store.event(context.run,'gateway',record.status==='completed'?'model_finished':'model_error',`Model ${record.httpStatus?`HTTP ${record.httpStatus}`:record.status}; generation ${record.status}; reported tokens ${record.totalTokens ?? 'unknown'} (${record.usage})`,{requestId:record.id,...record});
         }
       }
       const browserOrigin = req.headers.origin;
