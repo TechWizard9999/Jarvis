@@ -12,6 +12,14 @@ import { setTimeout as sleep } from 'node:timers/promises';
 export const toolNames = ['graph_query', 'graph_explain', 'graph_path', 'read_source', 'search_text', 'apply_patch', 'replace_source', 'run_check'] as const;
 export type AgentPhase = 'discovery' | 'reproduction' | 'review' | 'patching' | 'locked';
 type TurnPhase = AgentPhase | 'format';
+export class AgentReplyFormatError extends Error {
+  readonly replies: string[];
+  constructor(replies: readonly string[]) {
+    super('Agent did not return the requested final JSON object after 3 format retries');
+    this.name = 'AgentReplyFormatError';
+    this.replies = [...replies];
+  }
+}
 const nativeTools = ['bash', 'read', 'grep', 'glob', 'edit', 'write', 'patch', 'webfetch', 'websearch', 'task', 'skill', 'lsp', 'question', 'todowrite', 'todoread'];
 export function visibleTools(run: Manifest) { return toolNames.filter(n => run.input.retrieval !== 'text' || !n.startsWith('graph_')).map(n => `bugfix_${n}`); }
 function turnContract(run: Manifest, config: Config, phase: TurnPhase) {
@@ -30,7 +38,9 @@ function turnContract(run: Manifest, config: Config, phase: TurnPhase) {
   ];
   if (readOnly) {
     system.push(phase === 'review'
-      ? 'This is a read-only acceptance review. Inspect the existing tests and evidence against every explicit issue behavior, frozen requirement, edge form and passing control. Report coverage gaps honestly. Do not edit source or fixtures, run checks or formatters, add tests, or recreate the reproduction.'
+      ? run.acceptancePlan
+        ? 'This is a read-only acceptance review. Inspect the existing tests and evidence against every explicit issue behavior, frozen requirement, edge form and passing control. Report coverage gaps honestly. Do not edit source or fixtures, run checks or formatters, add tests, or recreate the reproduction.'
+        : 'This is read-only acceptance planning before any requirements or tests are frozen. Derive the complete acceptance matrix from the issue body, covering the reported examples, requested behavior, nearby edge cases and a passing control. Copy exact contiguous quotations from the issue body into citations; do not paraphrase or combine separate excerpts. Source inspection may inform expected behavior, but source text is not an issue citation. Do not edit source or fixtures, run checks or formatters, add tests, or begin reproduction.'
       : 'This is read-only discovery and planning. Inspect the issue and existing source, use Graphify first when available, and identify required behavior and supporting evidence. Do not edit source or fixtures or execute checks or formatters.');
   } else {
     system.push('apply_patch and replace_source use exact unique replacements with content hashes; they are the only ways to edit. After an edit the graph is stale.');
@@ -189,13 +199,15 @@ export class Agent {
   // `valid` checks the reply's shape; an unparsable or wrongly shaped reply is re-asked (up to 3 times) with the exact shape.
   async ask(prompt: string, signal: AbortSignal, valid: (answer: any) => boolean = () => true, phase: AgentPhase = 'discovery'): Promise<any> {
     let text = await this.turn(prompt, signal, phase);
+    const replies = [text];
     const shape = prompt.includes('Return exactly') ? prompt.slice(prompt.indexOf('Return exactly')) : 'the JSON object requested in the earlier message';
     for (let retry = 1; ; retry++) {
       try { const answer = parseAgentJson(text); if (valid(answer)) return answer; } catch {}
-      if (retry > 3) throw new Error('Agent did not return the requested final JSON object');
+      if (retry > 3) throw new AgentReplyFormatError(replies);
       // Models occasionally end a long tool-using turn with prose or an invented schema; ask again in the same session.
       await this.store.event(this.run, 'opencode', 'format_retry', `Final reply was not in the requested JSON shape; asking again with the exact shape (${retry}/3)`);
       text = await this.turn(`Your previous reply was not in the required format. Do not call any tools and do not redo any work. Using what you already found, reply with ONLY one JSON object (no prose, no code fence) in exactly this shape. ${shape}`, signal, 'format');
+      replies.push(text);
     }
   }
   private async turn(prompt: string, signal: AbortSignal, phase: TurnPhase): Promise<string> {

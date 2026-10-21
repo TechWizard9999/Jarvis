@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
 import fs from 'node:fs/promises';
-import { Agent } from '../src/agent.ts';
+import { Agent, AgentReplyFormatError } from '../src/agent.ts';
 import { Store } from '../src/store.ts';
 import { tempConfig } from './helpers.ts';
 
@@ -22,7 +22,7 @@ async function fixture(t: test.TestContext, replies = ['{"complete":true}']) {
   t.after(async () => { server.closeAllConnections(); await new Promise<void>(resolve => server.close(() => resolve())); await fs.rm(root, { recursive: true, force: true }); });
   const agent = new Agent(config, {} as any, store, run);
   agent.url = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
-  return { agent, bodies };
+  return { agent, bodies, run };
 }
 const enabled = (body: any) => Object.keys(body.tools).filter(name => body.tools[name]).sort();
 const readTools = ['bugfix_graph_query', 'bugfix_graph_explain', 'bugfix_graph_path', 'bugfix_read_source', 'bugfix_search_text'].sort();
@@ -106,5 +106,41 @@ test('overlapping turns cannot overwrite the trusted purpose of a running turn',
     await assert.rejects(agent.ask('Return exactly {}.', AbortSignal.timeout(5000), undefined, 'discovery'), /Another agent turn is active/);
     assert.equal(agent.turnPurpose, 'reproduction');
   } finally { release(); await running; }
+  assert.equal(agent.turnPurpose, undefined);
+});
+
+test('initial high-effort review plans acceptance from issue evidence without assuming frozen tests exist', async t => {
+  const { agent, bodies } = await fixture(t);
+  await agent.ask('Read the issue as evidence. Return exactly {"complete":true}.', AbortSignal.timeout(5000), undefined, 'review');
+  assert.deepEqual(enabled(bodies[0]), readTools);
+  assert.match(bodies[0].system, /acceptance planning/i);
+  assert.match(bodies[0].system, /issue body/i);
+  assert.match(bodies[0].system, /exact.*contiguous|contiguous.*exact/i);
+  assert.match(bodies[0].system, /source.*not.*citation|citation.*not.*source/i);
+  assert.doesNotMatch(bodies[0].system, /existing tests and evidence against every explicit issue behavior, frozen requirement/);
+});
+
+test('review after plan freeze retains independent coverage review instead of replanning acceptance', async t => {
+  const { agent, bodies, run } = await fixture(t);
+  run.acceptancePlan = [{ id: 'reported', expectedBehavior: 'Preserve ordinary output.', citation: 'Ordinary output must be preserved.', baseline: 'fail' }];
+  await agent.ask('Independently critique acceptance coverage. Return exactly {"complete":true}.', AbortSignal.timeout(5000), undefined, 'review');
+  assert.deepEqual(enabled(bodies[0]), readTools);
+  assert.match(bodies[0].system, /read.only acceptance review/i);
+  assert.match(bodies[0].system, /frozen requirement/i);
+  assert.doesNotMatch(bodies[0].system, /acceptance planning/i);
+});
+
+test('format exhaustion is typed, bounded and carries every unchanged raw reply privately', async t => {
+  const replies = ['initial invalid secret body', 'first malformed secret body', '{"wrong":"second secret body"}', 'third invalid secret body'];
+  const { agent, bodies } = await fixture(t, replies);
+  let thrown: any;
+  try { await agent.ask('Return exactly {"complete":true}.', AbortSignal.timeout(5000), answer => answer?.complete === true, 'review'); }
+  catch (error) { thrown = error; }
+  assert.ok(thrown instanceof AgentReplyFormatError);
+  assert.equal(thrown.constructor.name, 'AgentReplyFormatError');
+  assert.deepEqual(thrown.replies, replies);
+  assert.equal(bodies.length, 4);
+  assert.ok(bodies.slice(1).every(body => enabled(body).length === 0));
+  assert.doesNotMatch(thrown.message, /secret body|wrong/);
   assert.equal(agent.turnPurpose, undefined);
 });
