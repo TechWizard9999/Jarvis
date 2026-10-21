@@ -4,6 +4,12 @@ A local application for investigating a selected RTK issue, reproducing it in Do
 
 For host requirements and step-by-step installation, configuration, startup, and troubleshooting, see [SETUP.md](SETUP.md).
 
+## Current project status — 21 October 2026
+
+The [project handoff](CODEX_HANDOFF.md) records the implemented changes, deployed settings, validation, latest live result and next priorities. The workflow is reusable through repository profiles; this release implements GitHub Rust/Cargo support, with RTK as the configured real target. Additional languages need adapters. The current implementation uses one selected NVIDIA model and a fresh same-model coverage review; Nebius and automatic peer-model routing remain future work.
+
+The local release gates pass, but real autonomous repair remains under evaluation. The latest #4684 run corrected its planning citations, then stopped as `needs_attention` during reproduction without a patch or PR. Reproduction contract feedback, plan feasibility and ineffective-loop detection are the immediate priorities. See [TESTING.md](TESTING.md) for dated results and their limits.
+
 ## One command: issue → root cause → verified fix → draft PR
 
 On a new machine (macOS + Docker Desktop running, Git, Python 3):

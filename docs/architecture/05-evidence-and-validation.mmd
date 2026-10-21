@@ -1,0 +1,28 @@
+flowchart TB
+  subgraph LIVE["Normal run: two separate event paths"]
+    N["NVIDIA response stream"] --> G["Gateway: status, settings, usage and retry records"]
+    G --> O["OpenCode model response"]
+    O --> X["OpenCode event stream / message snapshots"]
+    X --> TR["Transcript delta reconciliation / reconnect backfill"]
+    TOOL["Controller tool calls + numbered results"] --> ST["Store: sequence IDs + atomic manifest revisions"]
+    CHECK["Check output + source revision + exact selectors"] --> ST
+    G --> ST
+    TR --> ST
+    ST --> FS[("Private manifest.json + events.jsonl<br/>source / reproduction / candidates / verification / reports")]
+    ST --> API["REST history + SSE replay<br/>Last-Event-ID / pagination / filtering"]
+    API --> UI["Dashboard / CLI<br/>Pause or follow visibility only"]
+  end
+  subgraph DEV["Separate development / evaluation plane"]
+    VERIFY["scripts/verify.mjs"] --> TS["Typecheck + unit tests"]
+    VERIFY --> WEB["Activity + Monitoring browser fixtures"]
+    VERIFY --> CARGO["Real Docker / Cargo / Git with scripted agent"]
+    VERIFY --> ADAPTER["Real OpenCode + local fake provider"]
+    VERIFY --> PUB["Publisher with local Git / mocked GitHub"]
+    PROBES["Small explicit real NVIDIA capability probes"]
+    HIST["Historical source / candidate behavior matrices"]
+    VERIFY --> RESULT[("state/verification logs and results")]
+    PROBES --> RESULT
+    HIST --> RESULT
+  end
+  NOTE["Passing local gates does not prove live NVIDIA streaming health<br/>or semantic correctness of a new repair"]
+  ADAPTER -.-> NOTE

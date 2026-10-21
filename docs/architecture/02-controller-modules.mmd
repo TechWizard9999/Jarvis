@@ -1,0 +1,29 @@
+flowchart LR
+  ENTRY["Entry points<br/>bugfix / setup.py / cli.ts / public/app.js"]
+  HTTP["server.ts<br/>UI auth, REST, SSE, internal routes"]
+  CONFIG["config.ts + profile.ts + lifecycle.ts<br/>Validated settings / frozen run identity / one operation"]
+  PIPE["pipeline.ts<br/>Run state machine and tool queue"]
+  subgraph GUARDS["Controller verification modules"]
+    ACCEPT["acceptance.ts<br/>Requirement / regression binding"]
+    POLICY["policy.ts + rust.ts + files.ts<br/>Edit, path, test and fixture protection"]
+    COVER["coverage-review.ts<br/>Fresh read and assertion witnesses"]
+    EVID["evidence.ts<br/>Current source read + exact bug-check proof"]
+    PROG["progress.ts<br/>Recurring verdict / recovery detection"]
+    CHECKS["checks.ts<br/>Trusted Cargo selectors and result parsing"]
+  end
+  AG["agent.ts + transcript.ts<br/>OpenCode sessions / phase tools / event reconciliation"]
+  PROV["provider.ts<br/>Sampling, effort, output, exact capability rule"]
+  DOCKER["docker.ts + process.ts + prepare.py<br/>Containers, command deadlines, cache, invalidation"]
+  GIT["git.ts<br/>Clean snapshots / exact trees / one-commit bundle"]
+  GH["github.ts + competing.ts + publication.ts<br/>Issue / competing PRs / remote observations"]
+  STORE["store.ts + report.ts + types.ts<br/>Atomic manifests / sequenced JSONL / reports"]
+  OTHER["doctor.ts / demo.ts<br/>Readiness checks / labelled simulation"]
+  ENTRY --> HTTP --> PIPE
+  CONFIG --> HTTP
+  CONFIG --> PIPE
+  PIPE --> ACCEPT & POLICY & COVER & EVID & PROG & CHECKS
+  PIPE --> AG & DOCKER & GIT & GH & STORE
+  AG --> STORE
+  HTTP --> PROV
+  HTTP --> STORE
+  HTTP --> OTHER
