@@ -41,6 +41,16 @@ export function changedFiles(before: Record<string, string>, after: Record<strin
   return [...new Set([...Object.keys(before), ...Object.keys(after)])].filter(p => before[p] !== after[p]).sort();
 }
 export interface Edit { path: string; before: string; after: string; }
+// Parses an edits array a model sent JSON-encoded as a string. Models sometimes close the last object with ']' or ')'
+// instead of '}', or drop the closers. Only what follows the final string value can follow it in a valid array, so that
+// tail is replaced with '}]'; every edit is still applied as an exact unique replacement.
+export function parseEdits(text: string): unknown {
+  const raw = text.trim(); let first: unknown;
+  for (const candidate of [raw, raw.replace(/"[^"]*$/, '"}]')]) {
+    try { return JSON.parse(candidate); } catch (e) { first ??= e; }
+  }
+  throw new Error(`edits was sent as a string that is not valid JSON (${first instanceof Error ? first.message : String(first)}); pass edits as an array of {path, before, after} objects`);
+}
 export async function applyEdits(root: string, edits: Edit[], allowedRoots = ['src', 'tests']) {
   if (!Array.isArray(edits) || edits.length < 1 || edits.length > 8) throw new Error('Supply 1–8 exact replacements');
   const staged = new Map<string, string>();

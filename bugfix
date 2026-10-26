@@ -9,10 +9,20 @@ BUGFIX_ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 cd "$BUGFIX_ROOT"
 command=${1:-help}
 if [ "$#" -gt 0 ]; then shift; fi
+# Recreating or stopping the controller ends every active run, so up/down refuse while one is active (--force overrides).
+refuse_if_active() {
+  for arg in "$@"; do [ "$arg" = "--force" ] && return 0; done
+  active=$(docker compose exec -T controller node -e "fetch('http://127.0.0.1:3210/api/status',{headers:{authorization:'Bearer '+require('fs').readFileSync(process.env.BUGFIX_STATE_DIR+'/ui-token','utf8').trim()}}).then(r=>r.json()).then(s=>console.log((s.active||[]).join(' '))).catch(()=>{})" 2>/dev/null || true)
+  if [ -n "$active" ]; then
+    printf 'A run is active (%s); restarting or stopping the controller would end it.\nWait for it to finish, or cancel it with ./bugfix cancel ID, or repeat with --force.\n' "$active" >&2
+    exit 1
+  fi
+}
 case "$command" in
   setup) exec python3 scripts/setup.py "$@" ;;
   build) docker compose --profile images build "$@" ;;
   up)
+    refuse_if_active "$@"
     BUGFIX_NETWORK_NAME=$(python3 scripts/setup.py --value BUGFIX_NETWORK --default bugfix-control)
     docker network inspect "$BUGFIX_NETWORK_NAME" >/dev/null 2>&1 || docker network create "$BUGFIX_NETWORK_NAME" >/dev/null
     docker compose up --build -d controller
@@ -22,7 +32,7 @@ case "$command" in
     while [ ! -s "$BUGFIX_STATE_PATH/ui-token" ] && [ "$attempt" -lt 40 ]; do sleep 1; attempt=$((attempt+1)); done
     if [ -s "$BUGFIX_STATE_PATH/ui-token" ]; then cat "$BUGFIX_STATE_PATH/ui-token"; printf '\n'; else printf 'Controller is still starting. Run ./bugfix logs.\n'; fi
     ;;
-  down) docker compose down ;;
+  down) refuse_if_active "$@"; docker compose down ;;
   logs) docker compose logs --tail 100 -f controller ;;
   clone|clone-rtk) exec python3 scripts/setup.py --clone "$@" ;;
   test) docker compose exec -T controller node --test /app/tests/*.test.ts ;;
@@ -30,6 +40,6 @@ case "$command" in
     # A run pauses while the Mac sleeps; keep it awake (idle sleep, and system sleep on AC power) until the run reports its outcome.
     if command -v caffeinate >/dev/null 2>&1; then exec caffeinate -i -s docker compose exec -T controller node src/cli.ts fix "$@"; fi
     exec docker compose exec -T controller node src/cli.ts fix "$@" ;;
-  doctor|run|list|tail|cancel|publish|demo) exec docker compose exec -T controller node src/cli.ts "$command" "$@" ;;
-  *) printf '%s\n' 'RTK Bugfix Agent' './bugfix setup [--install-docker] [--clone]' './bugfix build' './bugfix up' './bugfix doctor' './bugfix fix https://github.com/rtk-ai/rtk/issues/NUMBER    (RCA + verified patch + draft PR link)' './bugfix run --repo /absolute/path/to/rtk --issue https://github.com/rtk-ai/rtk/issues/NUMBER --publish' './bugfix demo | list | tail ID | cancel ID | publish ID | down | logs' ;;
+  doctor|run|list|tail|cancel|publish|demo|ask) exec docker compose exec -T controller node src/cli.ts "$command" "$@" ;;
+  *) printf '%s\n' 'RTK Bugfix Agent' './bugfix setup [--install-docker] [--clone]' './bugfix build' './bugfix up' './bugfix doctor' './bugfix fix https://github.com/rtk-ai/rtk/issues/NUMBER    (RCA + verified patch + draft PR link)' './bugfix ask "PROMPT" [--system TEXT] [--json]    (send a prompt straight to the configured model)' './bugfix run --repo /absolute/path/to/rtk --issue https://github.com/rtk-ai/rtk/issues/NUMBER --publish' './bugfix demo | list | tail ID | cancel ID | publish ID | down | logs' ;;
 esac

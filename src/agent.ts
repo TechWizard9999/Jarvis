@@ -90,7 +90,7 @@ export class Agent {
             let event: any; try { event = JSON.parse(data); } catch { continue; }
             const properties = event.properties || {}; const session = properties.sessionID || properties.info?.sessionID || properties.part?.sessionID;
             if (session && session !== this.run.sessionId) continue;
-            this.lastActivity = Date.now();
+            if (session) this.lastActivity = Date.now(); // global events (server heartbeats) are not turn progress
             if (event.type === 'message.part.updated' || event.type === 'message.part.delta') {
               const part = properties.part || properties;
               const text = part.text || properties.delta;
@@ -147,8 +147,10 @@ export class Agent {
         'Start discovery with Graphify when available. Read scoped source and cite event IDs. search_text requires a fallback reason. After the first edit the graph is stale.',
         `apply_patch uses exact unique text replacements; it is the only way to edit. Reproduction must add one self-contained ordinary #[test] inside an EXISTING cfg(test) module, without editing imports, helpers or production. Use fully qualified references. New fixtures must be under ${(this.run.profile || this.config.profile).fixtureRoot}/.`,
         `Allowed editable roots: ${[...(this.run.profile || this.config.profile).sourceRoots, ...(this.run.profile || this.config.profile).testRoots].join(', ')}. Allowed run_check IDs: ${[...(this.run.profile || this.config.profile).fastCheckIds, 'test-focused', 'test-module'].join(', ')}.`,
+        ...((this.run.profile || this.config.profile).agentNotes || []).map(note => `Repository note: ${note}`),
         'Use qualified Rust test names and --exact checks through run_check. A reproduction must fail at the intended assertion, not compilation or setup. Your final response must be only the JSON shape requested in the latest message.',
-        'A reproduction test asserts the CORRECT behavior the issue asks for, so it FAILS on the current code; never write a test that passes by asserting today\'s buggy behavior. Its citation must be a sentence copied verbatim from the issue body. Confirm the failure with test-focused before replying.',
+        'When asked to REVIEW a patch you are a read-only reviewer: never edit, trace the real command path to the printed output, and report concrete failing inputs; do not approve what you have not traced.',
+        'If the issue shows several failing examples, the single reproduction test must assert every one of them, one assert each, and the fix must address the shared cause rather than only the first example. A reproduction test asserts the CORRECT behavior the issue asks for, so it FAILS on the current code; never write a test that passes by asserting today\'s buggy behavior. Its citation must be a sentence copied verbatim from the issue title or body. Confirm the failure with test-focused before replying.',
       ].join('\n'),
     }, signal);
     if (result.info?.error) throw new Error(`OpenCode/model error: ${JSON.stringify(result.info.error)}`);

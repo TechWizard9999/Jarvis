@@ -3,7 +3,10 @@ import path from 'node:path';
 import type { Manifest } from './types.ts';
 import type { Store } from './store.ts';
 
+// Commit and PR subject: the title written from the verified diff when available, otherwise a generic one.
+export const prTitle = (run: Manifest) => run.summary?.title || `fix: resolve issue #${run.issue?.number}`;
 export async function writeReport(store: Store, run: Manifest) {
+  const explanation = run.summary?.explanation || run.candidate?.explanation;
   const flags = run.candidate?.snapshots || [];
   const lines = [
     `# ${run.profile?.id || 'Repository'} issue ${run.issue?.number || ''} — ${run.outcome || run.stage}`,
@@ -11,9 +14,11 @@ export async function writeReport(store: Store, run: Manifest) {
     run.demo ? '**SIMULATED DEMO: no repository repair or verification was performed.**' : `Base commit: \`${run.baseSha || 'unresolved'}\``,
     `Model: \`${run.model || 'not contacted'}\``, `Environment image: \`${run.imageId || 'not prepared'}\``,
     `Retrieval: ${run.input.retrieval || 'graph'}; tools: ${run.tools}; reported model tokens: ${run.tokens}`,
-    '', '## Cause and change', '', run.candidate?.explanation || 'No accepted candidate was produced.',
+    '', '## Cause and change', '', explanation || 'No accepted candidate was produced.',
     '', '## Regression evidence', '',
     run.regression ? `Test: \`${run.regression.spec.testName}\` in \`${run.regression.spec.file}\`\n\nExpected behavior: ${run.regression.spec.expectedBehavior}\n\nIssue excerpt${run.regression.spec.citationVerified === false ? ' (**not a verbatim excerpt; human review required**)' : ''}: ${run.regression.spec.citation || '(none given)'}\n\nFrozen test hash: \`${run.regression.functionHash}\`` : 'A valid failing regression was not established.',
+    ...(run.regression?.spec.examples?.length ? ['', '## Issue examples asserted by the regression test (agent-declared; review that none is missing)', '', ...run.regression.spec.examples.map(e => `- \`${e.replace(/\s+/g, ' ').slice(0, 300)}\``)] : []),
+    ...(run.review ? ['', '## Independent review', '', run.review.passed ? `Reviewer (${run.review.rounds} round${run.review.rounds > 1 ? 's' : ''}) traced the issue examples and found no gaps.` : `**Reviewer gaps still open after ${run.review.rounds} rounds; human review required:**`, ...run.review.unresolved.map(g => `- ${g.replace(/\s+/g, ' ').slice(0, 500)}`)] : []),
     '', '## Checks', '',
     ...run.checks.map(c => `- ${c.id}: exit ${c.exitCode}${c.timedOut ? ' (timeout)' : ''}; ${Math.round(c.durationMs / 1000)}s; \`${c.argv.join(' ')}\`; log: \`${c.log}\``),
     ...(Object.keys(run.profile?.skipTests || {}).length ? ['', '## Skipped upstream tests', '', ...Object.entries(run.profile!.skipTests!).map(([name, reason]) => `- \`${name}\`: ${reason}`)] : []),
@@ -28,9 +33,11 @@ export async function writeReport(store: Store, run: Manifest) {
   ];
   await fs.writeFile(path.join(store.dir(run.id), 'report.md'), lines.join('\n'));
   const pr = [
-    run.candidate?.explanation || 'RTK bug fix', '', `Refs ${run.issue?.url || run.input.issue}`, '',
+    explanation || 'RTK bug fix', '', `Refs ${run.issue?.url || run.input.issue}`, '',
     '### Reproduction and validation', '',
     `Regression: \`${run.regression?.spec.testName}\`. Confirmed failing on the baseline plus the new test${run.regression?.spec.failureAdopted ? ` (observed assertion: \`${run.regression.spec.failureContains}\`)` : ''}, and passing with the implementation change.`,
+    ...(run.regression?.spec.examples?.length ? ['', 'Issue examples asserted by the test (agent-declared):', ...run.regression.spec.examples.map(e => `- \`${e.replace(/\s+/g, ' ').slice(0, 300)}\``)] : []),
+    ...(run.review && !run.review.passed ? ['', 'Open reviewer findings (human review required):', ...run.review.unresolved.map(g => `- ${g.replace(/\s+/g, ' ').slice(0, 500)}`)] : []),
     '', ...run.checks.filter(c => c.id.startsWith('final-')).map(c => `- \`${c.argv.join(' ')}\`: ${c.exitCode === 0 ? 'passed' : 'failed'}`),
     '', `Verified tree: \`${run.verifiedTree}\`.`,
     ...Object.entries(run.profile?.skipTests || {}).map(([name, reason]) => `\nNot run locally (sandbox limitation, not related to this change): \`${name}\` — ${reason}`),

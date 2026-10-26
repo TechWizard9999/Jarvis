@@ -26,6 +26,28 @@ chmod 600 .secrets/*
 
 `fix` streams progress and ends by printing the outcome, the root-cause report path (`state/runs/RUN_ID/report.md`) and the **draft PR link**. Add `--no-publish` to stop at a verified local commit; publish it later with `./bugfix publish RUN_ID`.
 
+### Ask the model directly
+
+The controller also exposes the configured model (`BUGFIX_MODEL`, Nemotron by default) for a plain prompt, outside any repair run. It uses the same NVIDIA key, waits out rate limits (429) and retries transient failures like the run gateway, and stores nothing.
+
+```sh
+./bugfix ask "Explain what rtk hook claude does in two sentences"
+./bugfix ask "Summarise this diff" --system "You are a code reviewer" --reasoning   # also print the model's reasoning
+git diff | ./bugfix ask -                                                          # read the prompt from stdin
+./bugfix ask "Hello" --json                                                        # full response: answer, reasoning, usage
+```
+
+HTTP API (authenticated with the dashboard token in `state/ui-token`):
+
+```sh
+curl -s http://localhost:3210/api/chat \
+  -H "Authorization: Bearer $(cat state/ui-token)" -H 'content-type: application/json' \
+  -d '{"prompt":"What does git push do?","system":"Answer briefly."}'
+# → {"model":"nvidia/nemotron-3-ultra-550b-a55b","answer":"…","reasoning":"…","finishReason":"stop","usage":{…}}
+```
+
+Body fields: `prompt` (and optional `system`), or `messages` (`[{"role":"system|user|assistant","content":"…"}]`) for a conversation; optional `model` (another NVIDIA model ID), `max_tokens` (capped at `BUGFIX_MODEL_MAX_OUTPUT`) and `temperature`. A provider error (for example an unknown or retired model) returns HTTP 502 with `providerStatus`.
+
 Shipped defaults in `.env.example` (known working):
 
 | Setting | Value | Why |
@@ -35,13 +57,17 @@ Shipped defaults in `.env.example` (known working):
 | (none) | no token, tool-call or run-time cap | Runs continue until verified, `cannot_reproduce`, or `./bugfix cancel RUN_ID`. Rate-limited (HTTP 429) model requests are retried until answered. Token usage is reported, not capped. |
 | `BUGFIX_MODEL_MAX_OUTPUT` | `16384` | Room for the model's reasoning plus the final answer. |
 
-**What can stop a run.** Only a reproduction the agent cannot establish in 6 attempts (`cannot_reproduce`), a cancel, or a broken environment (Docker, baseline checks). Everything else is fed back to the model and retried:
+**What can stop a run.** Only a reproduction the agent cannot establish in 6 attempts (`cannot_reproduce`), a cancel, a provider that rejects the key or model (HTTP 401/403/404), a broken environment (Docker, baseline checks), or 5 consecutive harness faults during verification. There is no token, tool-call or time limit. Everything else is fed back to the model or retried:
 
-- a reply that is not the requested JSON shape: re-asked up to 3 times with the exact shape, then the whole turn is retried (up to 5 times with backoff) together with network/OpenCode/provider errors;
-- a citation that is not a verbatim issue excerpt: flagged for human review in the report, not rejected;
+- the GitHub issue fetch: anonymous first; when GitHub's shared anonymous quota (60 requests/hour per IP) is used up, the issue is read with `.secrets/github_token` inside the publisher container; network errors retry with backoff;
+- provider rate limits (HTTP 429) retry until answered; 5xx/network errors retry 5 times per request; a provider request silent for 5 minutes is abandoned and retried;
+- a reply that is not the requested JSON shape: re-asked up to 3 times with the exact shape; a failed turn (network, OpenCode, provider) is retried without limit, interrupting OpenCode each time and restarting it every third failure;
+- `apply_patch` edits sent as a JSON string (some models do this, sometimes closing the last object with `]`) are parsed and the brackets repaired; each edit is still an exact unique replacement;
+- a citation that is not a verbatim excerpt of the issue title or body: flagged for human review in the report, not rejected;
 - a test that fails with a different message than the model predicted: the observed assertion message is adopted (it must still be a deterministic assertion failure, not a compile/setup error, and a test that passes is never a reproduction);
-- `cannot_fix`, rejected candidates and missing evidence IDs: retried up to `BUGFIX_MAX_ATTEMPTS` (6) per round, evidence IDs are filled from the real tool results;
-- a candidate that fails independent verification (full workspace tests, Clippy, docs): returned to the patching stage with the failure output, up to 3 rounds.
+- a frozen test the agent shows can never pass under a correct fix (`test_defective`): the run returns to reproduction for a new test, at most 3 times;
+- `cannot_fix`, rejected candidates and missing evidence IDs: retried up to `BUGFIX_MAX_ATTEMPTS` per round; evidence IDs are filled from the real tool results;
+- a candidate that fails independent verification (full workspace tests, Clippy, docs): returned to patching with the failure output in a fresh agent session, round after round until one passes.
 
 The RTK baseline (fmt, Clippy, workspace tests, no-default-features Clippy/tests, docs) passes in the sandbox only with these worker-environment fixes, all in this repo:
 
@@ -68,7 +94,7 @@ Edit `.env`:
 - `BUGFIX_REPO_ROOT`: parent directory of permitted local clones. This directory and the state directory are mounted at identical host/container paths for Git worktrees.
 - `BUGFIX_RUST_TOOLCHAIN`: an explicitly pinned compiler compatible with the selected RTK commit; initial default `1.91.0`.
 
-Create `.secrets/nvidia_api_key` and `.secrets/github_token` using a local editor or password manager. Each file contains only its token. Set permissions to `600`. Never commit credentials, put them in issue text, or paste them into chat. Host `gh auth login` does not automatically authenticate the publisher container. The GitHub credential must support both fork push and upstream PR creation; verify those account capabilities. The NVIDIA credential is used only by the trusted model gateway. OpenCode receives a run-scoped gateway token instead of the actual NVIDIA key.
+Create `.secrets/nvidia_api_key` and `.secrets/github_token` using a local editor or password manager. Each file contains only its token. Set permissions to `600`. Never commit credentials, put them in issue text, or paste them into chat. Host `gh auth login` does not automatically authenticate the publisher container. The GitHub credential must support both fork push and upstream PR creation; verify those account capabilities. It is mounted only into the short-lived publisher container, which also reads the issue when GitHub's anonymous API quota (60 requests/hour per IP, often used up on office networks) is exhausted. The NVIDIA credential is used only by the trusted model gateway. OpenCode receives a run-scoped gateway token instead of the actual NVIDIA key.
 
 ```sh
 ./bugfix build
@@ -104,10 +130,10 @@ Use `--retrieval text` for the comparison control. Historical source copies expo
 2. Create a host-visible worktree, then export source files after comparing their Git blob IDs. Only the controller touches shared Git metadata. Worktree separation is not itself sandbox isolation.
 3. Fetch locked dependencies with network enabled in a credential-free container. Builds/tests then run with `--network none`. A controller-created baseline image warms the configured check profile once. Cache identity includes the base, lockfile, worker image/toolchain and profile recipe. Every run's image ID is recorded.
 4. Build the pinned Graphify code-only index. Use graph query/explain/path first, scoped text fallback second. Preserve extracted/inferred labels. Freeze graph use after the first edit. Execution containers mount source read-only; only the controller's validated edit tool writes it. Cargo output and temporary files use separate writable directories.
-5. Add a new self-contained ordinary inline Rust `#[test]` inside an existing test module. No production/import/helper edits are allowed in the accepted reproduction overlay. New fixtures must be in `tests/fixtures/`. The issue quote must be literal. The named test must execute and fail at the intended assertion three times; zero tests/compile/setup failures are rejected.
-6. Freeze the test syntax, attributes, enclosing module gating and new fixture contents. Try at most three candidates, using warm-cache formatting, default Clippy, focused regression and nearby module tests.
+5. Add a new self-contained ordinary inline Rust `#[test]` inside an existing test module. No production/import/helper edits are allowed in the accepted reproduction overlay; during reproduction `apply_patch` refuses on the spot any edit that changes or removes original text (only insertions pass), and a rejected attempt tells the agent the source was reset so it re-adds its test. New fixtures must be in `tests/fixtures/`. The issue quote should be literal (from the title or body); a non-literal quote is flagged for review. The named test must execute and fail at the intended assertion three times; zero tests/compile/setup failures are rejected.
+6. Freeze the test syntax, attributes, enclosing module gating and new fixture contents. Try up to `BUGFIX_MAX_ATTEMPTS` candidates per round, using warm-cache formatting, default Clippy, focused regression and nearby module tests; rounds repeat until a candidate passes independent verification.
 7. Stop the worker. Reconstruct two independent read-only trees: **base + identical regression overlay**, and **base + overlay + fix**. Never compare against a bare base lacking the new test. Start fresh verifier containers from the trusted cache, invalidate workspace outputs, demonstrate fail-to-pass, and run the configured full profile once. Never import agent-produced compiled artifacts.
-8. Confirm final content/tree hashes, export a patch including added files, and create a commit with an empty trusted hooks directory. With `--publish`, push that verified commit to the configured fork and create/read back a draft PR against `develop`.
+8. Confirm final content/tree hashes, export a patch including added files, and create a commit with an empty trusted hooks directory. The agent is shown the final verified diff and writes the commit/PR title (a conventional subject such as `fix(hook): …`) and the root-cause description from that diff alone, so edits it tried and reverted are not described; if that step fails, the patching explanation and a generic title are used. With `--publish`, push that verified commit to the configured fork and create/read back a draft PR against `develop`.
 
 Full local profile: `cargo fmt --all -- --check`, workspace/all-targets Clippy, workspace tests, no-default-features Clippy/tests, and docs. Cargo resolution commands use `--locked --offline`. This covers the configured Linux build, **not** all upstream platforms, `proxy/`, ignored integrations, security scanning or benchmark jobs. Initial issue scope excludes platform-specific, proxy/daemon, dependency, CI and external-service bugs. Baseline failures are blockers, not silently waived. The profile should be reviewed when changing the pinned RTK version. The actual checkout tested here is currently blocked by a pre-existing Clippy error; see [TESTING.md](TESTING.md).
 
@@ -115,7 +141,7 @@ Snapshot exceptions are narrow: declared, module-owned external snapshots or one
 
 ### OpenCode isolation
 
-Seven custom tools: `graph_query`, `graph_explain`, `graph_path`, `read_source`, `search_text`, `apply_patch`, `run_check`. Text control mode exposes only the last four. Native tools are deny-by-default in a controller-owned config directory with no repository mounts. The controller's NVIDIA gateway also filters the **actual outbound model tool definitions** to this allowlist and logs the resulting names, rather than trusting instructions alone. It rejects an incompatible tool catalog. Tool limits and per-run deadlines are enforced; token usage is reported when supplied and otherwise conservatively reserved from request size/output limits.
+Seven custom tools: `graph_query`, `graph_explain`, `graph_path`, `read_source`, `search_text`, `apply_patch`, `run_check`. Text control mode exposes only the last four. Native tools are deny-by-default in a controller-owned config directory with no repository mounts. The controller's NVIDIA gateway also filters the **actual outbound model tool definitions** to this allowlist and logs the resulting names, rather than trusting instructions alone. It rejects an incompatible tool catalog. There are no tool-call, token or time limits; token usage reported by the provider is recorded per run.
 
 ### Progress and recovery
 

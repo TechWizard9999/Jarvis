@@ -17,7 +17,7 @@ for (const directory of [artifacts, bin]) await fs.mkdir(directory, { recursive:
 checked(await exec('git', ['init', '--bare', remote]), 'Create local publication test remote');
 await fs.copyFile(path.join(evidence, 'verified.bundle'), path.join(artifacts, 'verified.bundle'));
 await fs.writeFile(path.join(artifacts, 'report-pr.md'), 'Scripted publisher integration fixture. No real GitHub PR.\n');
-const input = { runId: manifest.id, upstream: 'example/another', fork: 'test-user/another', branch: manifest.branch, commit: manifest.verifiedCommit, tree: manifest.verifiedTree, issue: 42, base: 'main' };
+const input = { runId: manifest.id, upstream: 'example/another', fork: 'test-user/another', branch: manifest.branch, commit: manifest.verifiedCommit, tree: manifest.verifiedTree, issue: 42, base: 'main', title: 'fix(fixture): keep error lines in output' };
 await atomicJson(path.join(artifacts, 'publication-input.json'), input);
 await fs.writeFile(path.join(root, 'fixture-token'), 'fixture-not-a-real-github-token', { mode: 0o600 });
 // This executable can only exist in the explicitly mounted test bin; production has the real gh.
@@ -35,7 +35,7 @@ if(a[0]==='api'){
 }else if(a[0]==='pr'&&a[1]==='create'){
   const value=n=>a[a.indexOf(n)+1];
   if(value('--repo')!==input.upstream||value('--base')!==input.base||!a.includes('--draft'))throw Error('Profile was ignored');
-  fs.copyFileSync(value('--body-file'),'/artifacts/mock-body.md');
+  fs.copyFileSync(value('--body-file'),'/artifacts/mock-body.md');fs.writeFileSync('/artifacts/mock-title',a.find(v=>v.startsWith('--title='))?.slice(8)||'');
   const count='/artifacts/mock-create-count';fs.writeFileSync(count,String(Number(fs.existsSync(count)?fs.readFileSync(count,'utf8'):0)+1));
   fs.writeFileSync(p,JSON.stringify({state:'open',draft:true,html_url:'https://github.com/example/another/pull/123',base:{ref:input.base},head:{sha:input.commit,ref:input.branch,repo:{full_name:input.fork}}}));
   if(fs.existsSync('/artifacts/mock-timeout')){console.error('Simulated network timeout after PR creation');process.exit(1);}
@@ -56,6 +56,7 @@ assert.equal(created.commit, input.commit); assert.equal(created.draft, true); a
 assert.equal(created.url, 'https://github.com/example/another/pull/123');
 // A competing open PR linked to the issue is disclosed in the draft description, never a blocker; the fork owner's own PRs are ignored.
 const body = await fs.readFile(path.join(artifacts, 'mock-body.md'), 'utf8');
+assert.equal(await fs.readFile(path.join(artifacts, 'mock-title'), 'utf8'), input.title);
 assert.match(body, /Other open PRs reference this issue: https:\/\/github\.com\/example\/another\/pull\/99\./); assert.doesNotMatch(body, /pull\/77/);
 // Reset only the mock API fixtures to exercise a separate uncertain-creation scenario.
 await fs.rm(path.join(artifacts, 'mock-pr.json'));

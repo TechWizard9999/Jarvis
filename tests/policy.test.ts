@@ -2,8 +2,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import path from 'node:path';
-import { copySource, applyEdits, sourcePath, safeRelative } from '../src/files.ts';
-import { assertCandidate, assertFrozen, freezeRegression, inFileTestName, regressionPassed, reproductionFailure } from '../src/policy.ts';
+import { copySource, applyEdits, parseEdits, sourcePath, safeRelative } from '../src/files.ts';
+import { assertCandidate, assertFrozen, assertInsertOnly, freezeRegression, inFileTestName, regressionPassed, reproductionFailure } from '../src/policy.ts';
 import { tempConfig, fixtureRepo, spec, withRegression, testName, original } from './helpers.ts';
 
 test('rejects path traversal, hidden Git metadata and symlinks', async t => {
@@ -56,6 +56,22 @@ test('exact replacement rejects ambiguous input and does not run shell text', as
   await assert.rejects(applyEdits(root, [{ path: 'src/a.rs', before: 'same', after: 'new' }]), /exactly once/);
   await applyEdits(root, [{ path: 'src/new.rs', before: '', after: '$(touch /tmp/SHOULD_NOT_RUN)' }]);
   assert.equal(await fs.readFile(path.join(root, 'src/new.rs'), 'utf8'), '$(touch /tmp/SHOULD_NOT_RUN)');
+});
+test('reproduction edits may only insert around original text; the new test itself may change freely', () => {
+  const original = 'mod tests {\n    #[test]\n    fn existing() { assert!(true); }\n}\n';
+  assertInsertOnly(original, { path: 'src/a.rs', before: '    #[test]\n    fn existing()', after: '    #[test]\n    fn added() {}\n\n    #[test]\n    fn existing()' });
+  assertInsertOnly(original, { path: 'src/a.rs', before: '    }\n}\n', after: '    }\n\n    #[test]\n    fn added() {}\n}\n' });
+  assertInsertOnly(original, { path: 'src/a.rs', before: '    fn added() { assert!(false); }', after: '    fn added() { assert!(true); }' });
+  assertInsertOnly('', { path: 'tests/fixtures/new.txt', before: '', after: 'fixture' });
+  assert.throws(() => assertInsertOnly(original, { path: 'src/a.rs', before: '    #[test]\n    fn existing() { assert!(true); }\n', after: '' }), /may only ADD code/);
+  assert.throws(() => assertInsertOnly(original, { path: 'src/a.rs', before: 'assert!(true)', after: 'assert!(false)' }), /may only ADD code/);
+  assert.throws(() => assertInsertOnly(original, { path: 'src/a.rs', before: 'fn existing() { assert!(true); }', after: 'fn existing() { assert!(true); assert!(false); }x' }), /may only ADD code/);
+});
+test('string-encoded edits parse, a damaged closing tail is repaired, and other damage is explained', () => {
+  const edits = [{ path: 'src/a.rs', before: 'x]\n}', after: 'y' }];
+  assert.deepEqual(parseEdits(JSON.stringify(edits)), edits);
+  for (const tail of [']]', ')]', '}', '', ' ] ]']) assert.deepEqual(parseEdits(JSON.stringify(edits).replace(/\}\]$/, tail)), edits);
+  assert.throws(() => parseEdits('[{"path": "src/a.rs", "before": x}]'), /not valid JSON.*pass edits as an array/);
 });
 
 test('an inline snapshot expectation requires a review flag and cannot change the tested expression', async t => {

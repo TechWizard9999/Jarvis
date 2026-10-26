@@ -3,6 +3,7 @@ import path from 'node:path';
 import { createHash } from 'node:crypto';
 import { exec, checked } from './process.ts';
 import { safeRelative, inventory, fingerprint } from './files.ts';
+import { prTitle } from './report.ts';
 import type { Config, Manifest } from './types.ts';
 
 export class Repository {
@@ -80,7 +81,7 @@ export class Repository {
     if (!this.config.gitName || !this.config.gitEmail) throw new Error('Configure BUGFIX_GIT_NAME and BUGFIX_GIT_EMAIL before publishing');
     const tree = await this.tree(run, source);
     if (tree !== run.verifiedTree) throw new Error('Candidate differs from verified tree');
-    checked(await this.git(run.worktree!, ['-c', `user.name=${this.config.gitName}`, '-c', `user.email=${this.config.gitEmail}`, '-c', 'commit.gpgSign=false', 'commit', '-m', `fix: resolve issue #${run.issue!.number}`]), 'Commit verified candidate');
+    checked(await this.git(run.worktree!, ['-c', `user.name=${this.config.gitName}`, '-c', `user.email=${this.config.gitEmail}`, '-c', 'commit.gpgSign=false', 'commit', '-m', prTitle(run), '-m', `Refs ${run.issue!.url}`]), 'Commit verified candidate');
     run.verifiedCommit = checked(await this.git(run.worktree!, ['rev-parse', 'HEAD']), 'Read verified commit');
     if (checked(await this.git(run.worktree!, ['rev-parse', 'HEAD^{tree}']), 'Read committed tree') !== tree) throw new Error('Commit tree mismatch');
     checked(await this.git(run.worktree!, ['bundle', 'create', bundle, run.branch!]), 'Prepare publisher bundle');

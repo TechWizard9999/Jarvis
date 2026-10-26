@@ -6,11 +6,13 @@ import { Agent } from './agent.ts';
 import { Docker } from './docker.ts';
 import { Repository } from './git.ts';
 import { Store, atomicJson } from './store.ts';
-import { applyEdits, copySource, fingerprint, hash, inventory, safeRelative, sourcePath } from './files.ts';
-import { assertCandidate, assertFrozen, failedAssertion, freezeRegression, regressionPassed, reproductionFailure } from './policy.ts';
+import { applyEdits, copySource, fingerprint, hash, inventory, parseEdits, safeRelative, sourcePath } from './files.ts';
+import { assertCandidate, assertFrozen, assertInsertOnly, failedAssertion, freezeRegression, inFileTestName, regressionPassed, reproductionFailure } from './policy.ts';
 import { fastChecks, focusedCheck } from './checks.ts';
 import { checked } from './process.ts';
-import { writeReport } from './report.ts';
+import { extractTest } from './rust.ts';
+import { prTitle, writeReport } from './report.ts';
+import { reviewPrompt, reviewProblems, validReview } from './review.ts';
 import type { Candidate, CheckResult, Config, Issue, Manifest, Outcome, Regression, RunInput } from './types.ts';
 import { defaultProfile } from './profile.ts';
 import type { RepositoryProfile } from './profile.ts';
@@ -22,7 +24,7 @@ class HarnessFailure extends Error {}
 class VerdictFailure extends Error {}
 const harnessError = /Cannot connect to the Docker daemon|Error response from daemon|OCI runtime (?:exec|create|start) failed/;
 export interface RepairAgent { toolToken: string; providerToken: string; preflight?(): Promise<void>; start(signal: AbortSignal): Promise<void>; ask(prompt: string, signal: AbortSignal, valid?: (answer: any) => boolean): Promise<any>; stop(): Promise<void>; interrupt?(): Promise<void>; restart?(signal: AbortSignal): Promise<void>; touch?(): void; }
-interface Context { run: Manifest; abort: AbortController; agent: RepairAgent; source: string; base: string; phase: 'discovery' | 'reproduction' | 'patching' | 'locked'; queue: Promise<unknown>; providerRejected?: string; }
+interface Context { run: Manifest; abort: AbortController; agent: RepairAgent; source: string; base: string; phase: 'discovery' | 'reproduction' | 'patching' | 'review' | 'describe' | 'locked'; queue: Promise<unknown>; providerRejected?: string; }
 export function validateInput(input: RunInput, profile: RepositoryProfile = defaultProfile): RunInput {
   if (!input || typeof input.repo !== 'string' || !path.isAbsolute(input.repo)) throw new Error('Provide an absolute repository path');
   const issue = new URL(input.issue);
@@ -44,9 +46,16 @@ export class Pipeline {
     this.agentFactory = run => new Agent(config, this.docker, store, run);
     this.issueLoader = async run => {
       const number = Number(new URL(run.input.issue).pathname.split('/').filter(Boolean).at(-1));
-      const response = await fetch(`https://api.github.com/repos/${(run.profile || this.config.profile).upstream}/issues/${number}`, { headers: { accept: 'application/vnd.github+json', 'user-agent': 'bugfix-agent/0.1' }, signal: AbortSignal.timeout(30000) });
-      if (!response.ok) throw new Error(`GitHub issue fetch: HTTP ${response.status}; check network/API rate limits`);
-      const issue = await response.json() as any;
+      const endpoint = `repos/${(run.profile || this.config.profile).upstream}/issues/${number}`;
+      const response = await fetch(`https://api.github.com/${endpoint}`, { headers: { accept: 'application/vnd.github+json', 'user-agent': 'bugfix-agent/0.1' }, signal: AbortSignal.timeout(30000) });
+      let issue: any;
+      if (response.ok) issue = await response.json();
+      // Anonymous calls share a 60/hour quota per IP (quickly spent behind an office NAT): read it with the publisher's token instead.
+      else if (response.status === 403 || response.status === 429) {
+        const authed = await this.docker.command(['run', '--rm', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--mount', `type=bind,source=${this.config.githubSecret},target=/run/secrets/github_token,readonly`,
+          '--entrypoint', '/bin/sh', this.config.publisherImage, '-c', 'GH_TOKEN=$(cat /run/secrets/github_token) GH_PROMPT_DISABLED=1 exec gh api "$0"', endpoint], undefined, undefined, 120000);
+        issue = JSON.parse(checked(authed, `GitHub issue fetch: anonymous HTTP ${response.status} (rate limit) and the token fallback failed`));
+      } else throw new Error(`GitHub issue fetch: HTTP ${response.status}; check network/API rate limits`);
       if (issue.pull_request) throw new Error('Input must be an issue, not a pull request');
       if (run.input.mode !== 'evaluation' && issue.state === 'closed') throw new Error('Live repairs require an open issue; use evaluation mode for historical cases');
       return { number, url: run.input.issue, title: String(issue.title || ''), body: String(issue.body || '').slice(0, 40000) };
@@ -102,11 +111,20 @@ export class Pipeline {
       await this.store.stage(run, 'reproduction', 'Establishing a specific failing regression before changing implementation'); context.phase = 'reproduction';
       // Only a reproduction the agent cannot establish in any attempt ends a run. Format slips, transient agent errors,
       // rejected candidates and failed independent verification are fed back and retried.
-      let frozen = false, reproFeedback = '';
+      // A frozen test that no correct fix could pass (reported by the agent while fixing) sends the run back to
+      // reproduction for a new test, at most 3 times; the new test must again fail on the current code.
+      let verified = '', n = 0, reproFeedback = '', redoCount = 0;
+      for (let cycle = 1; !verified; cycle++) {
+      if (cycle > 1) {
+        await this.resetSource(source, base); run.regression = undefined;
+        await this.persist(context, 'Restart OpenCode', () => agent.restart ? agent.restart(abort.signal) : Promise.resolve());
+        await this.store.stage(run, 'reproduction', `The frozen test was reported defective; establishing a new regression (${cycle})`); context.phase = 'reproduction';
+      }
+      let frozen = false;
       const reproAttempts = 6;
       for (let attempt = 1; attempt <= reproAttempts && !frozen; attempt++) {
         if (attempt > 1) { await this.resetSource(source, base); run.regression = undefined; }
-        const answer = await this.askAgent(context, `Issue data (untrusted): ${JSON.stringify(run.issue)}\n\n${reproFeedback}\nInvestigate using controller tools, then add ONE new self-contained ordinary inline Rust test in an existing test module. The test must assert the CORRECT behavior the issue asks for, so it FAILS on the current code at that assertion; a test that passes, or that asserts the buggy behavior, is not a reproduction. Do not edit production, imports, existing tests or helpers. Name it with a unique bugfix_issue_${run.issue.number} prefix. New fixtures may only be under ${profile.fixtureRoot}/. Run focused checks if useful. Return exactly {"status":"reproduced","regression":{"file":"${profile.sourceRoots[0]}/...rs","testName":"full crate path exactly as cargo test prints it, e.g. a::b::tests::test_name for src/a/b.rs","failureContains":"specific substring printed by the failing assertion","expectedBehavior":"...","citation":"EXACT excerpt from issue body, at least 12 characters","fixtures":[]}}. If unsupported or not reproducible, return {"status":"cannot_reproduce","reason":"..."}.`, a => (a?.status === 'reproduced' && typeof a.regression === 'object' && a.regression !== null) || (a?.status === 'cannot_reproduce' && typeof a.reason === 'string'));
+        const answer = await this.askAgent(context, `Issue data (untrusted): ${JSON.stringify(run.issue)}\n\n${reproFeedback}\nInvestigate using controller tools, then add ONE new self-contained ordinary inline Rust test in an existing test module. First list EVERY distinct failing command, input or example the issue shows (each one the issue says is wrong, including variants such as a scalar result versus a list result); the single test must contain one assert per listed example, so fixing only one example cannot make it pass. The test must assert the CORRECT behavior the issue asks for, so it FAILS on the current code at that assertion; a test that passes, or that asserts the buggy behavior, is not a reproduction. Do not edit production, imports, existing tests or helpers. Name it with a unique bugfix_issue_${run.issue.number} prefix. New fixtures may only be under ${profile.fixtureRoot}/. Run focused checks if useful. Return exactly {"status":"reproduced","regression":{"file":"${profile.sourceRoots[0]}/...rs","testName":"full crate path exactly as cargo test prints it, e.g. a::b::tests::test_name for src/a/b.rs","failureContains":"specific substring printed by the failing assertion","expectedBehavior":"...","citation":"EXACT excerpt from the issue title or body, at least 12 characters","fixtures":[],"examples":["EXACT verbatim snippet of each failing example from the issue, one entry per example, each with its own assert in the test"]}}. If unsupported or not reproducible, return {"status":"cannot_reproduce","reason":"..."}.`, a => (a?.status === 'reproduced' && typeof a.regression === 'object' && a.regression !== null) || (a?.status === 'cannot_reproduce' && typeof a.reason === 'string'));
         if (answer.status !== 'reproduced') {
           const reason = String(answer.reason || 'The agent could not establish the reported behavior');
           if (attempt === reproAttempts) throw new RunFailure('cannot_reproduce', reason);
@@ -119,9 +137,17 @@ export class Pipeline {
           // The citation is advisory: compared ignoring whitespace and Markdown marks, and flagged for review when it is not a verbatim excerpt.
           const plain = (text: string) => text.replace(/[`*_]/g, '').replace(/\s+/g, ' ').trim();
           spec.citation = typeof spec.citation === 'string' ? spec.citation : '';
-          spec.citationVerified = plain(spec.citation).length >= 12 && plain(run.issue.body).includes(plain(spec.citation));
+          spec.citationVerified = plain(spec.citation).length >= 12 && [run.issue.title, run.issue.body].some(text => plain(text).includes(plain(spec.citation)));
           if (!spec.citationVerified) await this.store.event(run, 'verifier', 'citation_unverified', `Citation is not a verbatim issue excerpt; flagged for human review: ${spec.citation.slice(0, 300)}`);
           spec.failureContains = typeof spec.failureContains === 'string' ? spec.failureContains : '';
+          // Every example the issue shows must be listed and asserted: a test for only the first one lets a partial fix pass.
+          spec.examples = Array.isArray(spec.examples) ? spec.examples.filter((e): e is string => typeof e === 'string' && e.trim().length > 0).map(e => e.trim()) : [];
+          if (!spec.examples.length) throw new Error('regression.examples must list every failing example the issue shows, one verbatim snippet each');
+          const unverified = spec.examples.filter(e => ![run.issue!.title, run.issue!.body].some(text => plain(text).includes(plain(e))));
+          if (unverified.length) await this.store.event(run, 'verifier', 'example_unverified', `Examples that are not verbatim issue excerpts; flagged for human review: ${unverified.join(' | ').slice(0, 500)}`);
+          const written = extractTest(await fs.readFile(await sourcePath(source, spec.file), 'utf8'), inFileTestName(spec));
+          const asserts = (written.canonical.match(/\bassert(?:_eq|_ne|_matches)?\b/g) || []).length;
+          if (asserts < spec.examples.length && !/\bfor\b/.test(written.canonical)) throw new Error(`The test has ${asserts} assertion(s) for ${spec.examples.length} listed examples; assert every listed example in the same test`);
           run.regression = await freezeRegression(base, source, spec, profile);
           await this.retryHarness(context, async () => { for (let repeat = 1; repeat <= 3; repeat++) {
             const result = await this.check(context, run.workerContainer!, `repro-${attempt}-${repeat}`, focusedCheck('test-focused', spec.testName, profile));
@@ -141,16 +167,16 @@ export class Pipeline {
           await atomicJson(path.join(this.store.dir(run.id), 'reproduction/frozen.json'), run.regression);
           await fs.writeFile(path.join(this.store.dir(run.id), 'reproduction/regression.patch'), await this.repository.diff(run, source));
           frozen = true;
-        } catch (e) { reproFeedback = `The controller rejected reproduction attempt ${attempt}: ${String(e)}. Source is reset to the original snapshot for the next attempt.`; await this.store.event(run, 'verifier', 'repro_rejected', reproFeedback); }
+        } catch (e) { reproFeedback = `The controller rejected reproduction attempt ${attempt}: ${String(e)}. The source has been RESET to the original snapshot: your test and every other edit are gone. Add the test again with apply_patch (only adding code), confirm with test-focused that it fails at its assertion, and only then reply.`; await this.store.event(run, 'verifier', 'repro_rejected', reproFeedback); }
       }
       if (!frozen || !run.regression) throw new RunFailure('cannot_reproduce', reproFeedback);
       await this.store.stage(run, 'patching', 'Regression frozen; trying a bounded minimal implementation change'); context.phase = 'patching';
       // Patching continues round after round (a fresh agent session each round) until a candidate passes independent
       // verification or the run is cancelled.
       // A harness fault during verification re-runs verification (5 in a row is a real environment problem).
-      let feedback = '', verified = '', n = 0, workerRunning = true, reverify = false, harnessFaults = 0;
+      let feedback = '', workerRunning = true, reverify = false, harnessFaults = 0, redo = false, reviews = 0;
       const frozenSource = path.join(this.store.dir(run.id), 'regression-source');
-      for (let round = 1; !verified; round++) {
+      for (let round = 1; !verified && !redo; round++) {
         if (round > 1 && !reverify) {
           if (!workerRunning) { await this.restartWorker(context); workerRunning = true; }
           await this.persist(context, 'Restart OpenCode', () => agent.restart ? agent.restart(abort.signal) : Promise.resolve());
@@ -159,9 +185,18 @@ export class Pipeline {
         let ready = reverify; reverify = false;
         if (!ready) for (let attempt = 1; attempt <= this.config.maxAttempts; attempt++) {
           n++; run.attempt = n; await this.store.save(run);
-          const answer = await this.askAgent(context, `The controller confirmed and froze ${run.regression.spec.testName}. Fix implementation only, preserving frozen test/fixtures, all existing tests, manifests and CI. ${feedback}\nUse apply_patch and run_check as needed. Return exactly {"explanation":"root cause, evidence, and resulting behavior","evidenceIds":[SOURCE_READ_EVENT_ID,TEST_CHECK_EVENT_ID],"snapshots":[]}. A justified snapshot update must list {"path":"...","owner":"changed source path","reason":"issue-grounded explanation"}; it will require human review. Stop honestly with {"cannot_fix":"reason"} if needed.`, a => typeof a?.explanation === 'string' || typeof a?.cannot_fix === 'string');
+          const answer = await this.askAgent(context, `The controller confirmed and froze ${run.regression.spec.testName}. Fix implementation only, preserving frozen test/fixtures, all existing tests, manifests and CI. Fix the root cause, not one symptom: first state the invariant the code violates, make the change at that level so it holds for every example the frozen test asserts and for similar inputs, and name that invariant in the explanation. ${feedback}\nUse apply_patch and run_check as needed. Return exactly {"explanation":"root cause, evidence, and resulting behavior","evidenceIds":[SOURCE_READ_EVENT_ID,TEST_CHECK_EVENT_ID],"snapshots":[]}. A justified snapshot update must list {"path":"...","owner":"changed source path","reason":"issue-grounded explanation"}; it will require human review. Stop honestly with {"cannot_fix":"reason"} if needed. If the frozen test itself can never pass under any correct fix (for example its setup never reaches the code path), return {"test_defective":"concrete evidence"} instead.`, a => typeof a?.explanation === 'string' || typeof a?.cannot_fix === 'string' || typeof a?.test_defective === 'string');
           if (answer.cannot_fix) {
             feedback = `In attempt ${n} you reported cannot_fix: ${String(answer.cannot_fix)}. The frozen test defines the required behavior; make the smallest implementation change that makes it pass without breaking other tests.`;
+            await this.store.event(run, 'verifier', 'candidate_rejected', feedback); await this.revertCandidate(run, source, frozenSource); continue;
+          }
+          if (typeof answer.test_defective === 'string') {
+            if (redoCount < 3) {
+              redoCount++; redo = true;
+              reproFeedback = `The previously frozen test ${run.regression.spec.testName} was reported defective while fixing: ${answer.test_defective}. Write a NEW regression with a new unique name that a correct fix can make pass, following the repository notes.`;
+              await this.store.event(run, 'verifier', 'test_defective', reproFeedback); break;
+            }
+            feedback = `The frozen test was already replaced 3 times; it stays. Make the smallest implementation change that makes it pass.`;
             await this.store.event(run, 'verifier', 'candidate_rejected', feedback); await this.revertCandidate(run, source, frozenSource); continue;
           }
           try {
@@ -191,6 +226,16 @@ export class Pipeline {
           }
         }
         if (!ready) continue;
+        // A fresh read-only reviewer audits the candidate against the issue's examples while the worker is still up.
+        // Findings go back to the patcher like a verification verdict; after 2 rejected reviews the open gaps are recorded for the human reviewer.
+        if (!reverify && reviews < 3 && run.issue && run.candidate) {
+          const problems = await this.review(context, run.regression.spec.examples || [], ++reviews);
+          if (problems.length && reviews <= 2) {
+            feedback = `An independent reviewer found these gaps in your change relative to the issue. Fix the root cause so each is resolved, without weakening the stated invariant or editing the frozen test:\n- ${problems.join('\n- ')}`;
+            await this.store.event(run, 'reviewer', 'review_rejected', feedback.slice(0, 20000));
+            await this.store.stage(run, 'patching', `Addressing the reviewer's findings (review ${reviews})`); continue;
+          }
+        }
         context.phase = 'locked'; await this.docker.remove(run.workerContainer!); workerRunning = false;
         await this.store.stage(run, 'verification', 'Verifying baseline failure and candidate success in independent containers');
         const target = path.join(this.store.dir(run.id), 'verified-source'); const started: string[] = [];
@@ -228,7 +273,10 @@ export class Pipeline {
           }
         } finally { for (const name of started) await this.docker.remove(name).catch(() => {}); }
       }
-      await fs.writeFile(path.join(this.store.dir(run.id), 'candidate.patch'), await this.repository.diff(run, verified));
+      }
+      const patch = await this.repository.diff(run, verified);
+      await fs.writeFile(path.join(this.store.dir(run.id), 'candidate.patch'), patch);
+      await this.describe(context, patch);
       run.outcome = 'verified_patch'; await this.store.save(run); await writeReport(this.store, run);
       if (this.config.gitName && this.config.gitEmail) { await this.repository.commit(run, verified, path.join(this.store.dir(run.id), 'verified.bundle')); await this.store.save(run); }
       // Publication is idempotent (the publisher reconciles an existing PR first), so transient failures are retried.
@@ -236,8 +284,10 @@ export class Pipeline {
     } catch (error) {
       if (abort.signal.aborted) { const reason = abort.signal.reason; run.outcome = reason instanceof RunFailure ? reason.outcome : 'cancelled'; }
       else if (error instanceof RunFailure) run.outcome = error.outcome;
-      else run.outcome = ['verified_patch', 'verified_unpublished', 'draft_created'].includes(run.outcome || '') ? 'verified_unpublished' : run.stage === 'verification' || run.stage === 'patching' ? 'verification_failed' : 'environment_blocked';
-      run.error = String(error instanceof Error ? error.message : error);
+      else run.outcome = ['verified_patch', 'verified_unpublished', 'draft_created'].includes(run.outcome || '') ? 'verified_unpublished' : ['patching', 'review', 'verification'].includes(run.stage) ? 'verification_failed' : 'environment_blocked';
+      // A cancelled run reports why it was stopped, not the abort error it surfaced through.
+      const cause = abort.signal.aborted && abort.signal.reason instanceof Error ? abort.signal.reason : error;
+      run.error = String(cause instanceof Error ? cause.message : cause);
       await this.store.event(run, 'controller', 'error', run.error);
     } finally {
       try {
@@ -305,6 +355,44 @@ export class Pipeline {
       }
     }
   }
+  // Returns the blocking problems the reviewer found; empty when it passed or could not run (recorded either way).
+  private async review(context: Context, examples: string[], round: number): Promise<string[]> {
+    const { run } = context;
+    try {
+      const patch = await this.repository.diff(run, context.source);
+      await this.persist(context, 'Restart OpenCode for review', () => context.agent.restart ? context.agent.restart(context.abort.signal) : Promise.resolve());
+      context.phase = 'review'; await this.store.stage(run, 'review', `Independent review of the candidate against the issue (review ${round})`);
+      const verdict = await context.agent.ask(reviewPrompt(run.issue!, examples, patch, run.candidate!.explanation || ''), context.abort.signal, validReview);
+      const problems = reviewProblems(verdict);
+      run.review = { rounds: round, passed: !problems.length, unresolved: problems, verdict }; await this.store.save(run);
+      await this.store.event(run, 'reviewer', problems.length ? 'review_gaps' : 'review_passed', problems.length ? problems.join('\n').slice(0, 20000) : 'Reviewer traced every example and found no gaps', verdict);
+      return problems;
+    } catch (e) {
+      if (context.abort.signal.aborted) throw e;
+      await this.store.event(run, 'reviewer', 'review_unavailable', `Review could not run (${String(e instanceof Error ? e.message : e).slice(0, 300)}); continuing to verification`);
+      return [];
+    } finally { context.phase = 'patching'; }
+  }
+  // The candidate explanation is written mid-repair and can describe edits that were later reverted, so the commit and
+  // PR text are rewritten from the verified diff. Optional: after 3 failed tries the candidate explanation is kept.
+  private async describe(context: Context, patch: string) {
+    // 'describe' keeps the agent's model access (the gateway refuses it only when 'locked') but no tools.
+    const { run } = context; context.phase = 'describe';
+    const prompt = `Independent verification passed. This is the FINAL verified diff against the original code:\n\n${patch.slice(0, 40000)}\n\nWrite the pull request text for maintainers without calling tools. Describe only what this diff changes relative to the original code: the root cause in the original code, the change, and the resulting behavior. Do not mention edits you made and later reverted. Return exactly {"title":"conventional commit subject such as fix(scope): summary, at most 72 characters","explanation":"..."}.`;
+    try {
+      for (let attempt = 1; attempt <= 3; attempt++) {
+        try {
+          const answer = await context.agent.ask(prompt, context.abort.signal, a => typeof a?.title === 'string' && typeof a?.explanation === 'string');
+          const title = String(answer.title).replace(/\s+/g, ' ').trim().replace(/\.$/, ''), explanation = String(answer.explanation).trim();
+          if (!/^[a-z]+(\([A-Za-z0-9_./-]+\))?!?: \S/.test(title) || title.length > 72 || explanation.length < 40) throw new Error(`Unusable title or explanation: ${title.slice(0, 100)}`);
+          run.summary = { title, explanation: explanation.slice(0, 8000) }; await this.store.event(run, 'controller', 'summary', title); return;
+        } catch (e) {
+          if (context.abort.signal.aborted) throw e;
+          await this.store.event(run, 'controller', 'agent_retry', `PR description attempt ${attempt} failed (${String(e instanceof Error ? e.message : e).slice(0, 300)})`);
+        }
+      }
+    } finally { context.phase = 'locked'; }
+  }
   // A cancelled run accepts no further tool calls, checks or model requests. There is no token, tool or time cap.
   ensureActive(context: Context) { if (context.abort.signal.aborted) throw context.abort.signal.reason; }
   async tool(id: string, name: string, args: any) {
@@ -313,7 +401,8 @@ export class Pipeline {
   }
   private async performTool(context: Context, name: string, args: any) {
     this.ensureActive(context); context.agent.touch?.(); const { run, source } = context;
-    if (context.phase === 'locked') throw new Error('Agent tools are locked during independent verification/publication');
+    if (context.phase === 'locked' || context.phase === 'describe') throw new Error('Agent tools are locked during independent verification/publication');
+    if (context.phase === 'review' && name === 'apply_patch') throw new Error('The reviewer is read-only: apply_patch is refused during review; report gaps in the verdict instead');
     run.tools++; await this.store.save(run);
     const called = await this.store.event(run, 'tool', 'called', name, { tool: name, args }); let result: unknown;
     try {
@@ -342,11 +431,12 @@ export class Pipeline {
         if (!['reproduction', 'patching'].includes(context.phase)) throw new Error('Edits are unavailable in this stage');
         const backups = new Map<string, string | null>();
         // Some models send the edits array JSON-encoded as a string; accept both shapes.
-        if (typeof args.edits === 'string') { try { args.edits = JSON.parse(args.edits); } catch { throw new Error('edits must be an array of {path, before, after} objects'); } }
+        if (typeof args.edits === 'string') args.edits = parseEdits(args.edits);
         if (!Array.isArray(args.edits)) throw new Error('edits must be an array of {path, before, after} objects');
         for (const edit of args.edits) {
           const file = await sourcePath(source, edit.path, true);
           if (!backups.has(edit.path)) backups.set(edit.path, await fs.readFile(file, 'utf8').catch(e => { if (e.code === 'ENOENT') return null; throw e; }));
+          if (context.phase === 'reproduction' && typeof edit?.before === 'string' && typeof edit?.after === 'string') assertInsertOnly(await fs.readFile(await sourcePath(context.base, edit.path, true), 'utf8').catch(() => ''), edit);
         }
         try {
           const profile = run.profile || this.config.profile;
@@ -371,7 +461,7 @@ export class Pipeline {
       return { evidenceId: event.seq, result };
     } catch (error) { await this.store.event(run, 'tool', 'rejected', String(error), { tool: name, call: called.seq }); throw error; }
   }
-  async cancel(id: string) { const context = this.contexts.get(id); if (!context) throw new Error('Run is not active'); context.abort.abort(new RunFailure('cancelled', 'Cancelled by user')); await context.agent.stop(); await this.docker.cleanup(context.run); }
+  async cancel(id: string, reason = new RunFailure('cancelled', 'Cancelled by user')) { const context = this.contexts.get(id); if (!context) throw new Error('Run is not active'); context.abort.abort(reason); await context.agent.stop(); await this.docker.cleanup(context.run); }
   private async resetSource(source: string, base: string) { for (const entry of await fs.readdir(source)) await fs.rm(path.join(source, entry), { recursive: true, force: true }); await copySource(base, source); }
   async publish(run: Manifest, signal = AbortSignal.timeout(this.config.commandTimeoutMs)) {
     if (run.demo || run.input.mode === 'evaluation' || !run.verifiedTree || !run.verifiedCommit) throw new Error('Only a verified live commit can be published');
@@ -380,7 +470,7 @@ export class Pipeline {
     await this.requirePublishSecret(); await this.docker.imageId(this.config.publisherImage);
     await this.store.stage(run, 'publishing', 'Pushing the exact verified commit and reconciling draft PR creation');
     run.publication = { ...run.publication, state: 'pending', fork: this.config.fork, head: run.branch!, base: profile.baseBranch }; await this.store.save(run); await writeReport(this.store, run);
-    await atomicJson(path.join(this.store.dir(run.id), 'publication-input.json'), { runId: run.id, upstream: profile.upstream, fork: this.config.fork, branch: run.branch, commit: run.verifiedCommit, tree: run.verifiedTree, issue: run.issue!.number, base: profile.baseBranch });
+    await atomicJson(path.join(this.store.dir(run.id), 'publication-input.json'), { runId: run.id, upstream: profile.upstream, fork: this.config.fork, branch: run.branch, commit: run.verifiedCommit, tree: run.verifiedTree, issue: run.issue!.number, base: profile.baseBranch, title: prTitle(run) });
     const container = `bugfix-${run.id}-publisher`;
     try {
       const result = await this.docker.command(['run', '--name', container, '--label', `bugfix.run=${run.id}`, '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges',
