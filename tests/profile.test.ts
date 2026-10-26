@@ -40,7 +40,7 @@ test('skipTests adds explicit --skip filters to cargo test commands only and req
 test('profiles reject unsupported adapters and paths outside approved roots', async t => {
   const { root } = await tempConfig(); t.after(() => fs.rm(root, { recursive: true, force: true }));
   const file = path.join(root, 'invalid.json');
-  for (const change of [{ adapter: 'python' }, { sourceRoots: ['../outside'] }, { fixtureRoot: 'other/fixtures' }, { fastCheckIds: ['missing'] }, { baseBranch: '--bad' }, { checks: { test: 'cargo test' } }]) {
+  for (const change of [{ adapter: 'python' }, { sourceRoots: ['../outside'] }, { fixtureRoot: 'other/fixtures' }, { fastCheckIds: ['missing'] }, { baseBranch: '--bad' }, { checks: { test: 'cargo test' } }, { agentNotes: 'not a list' }, { agentNotes: [''] }, { agentNotes: ['x'.repeat(1001)] }]) {
     await fs.writeFile(file, JSON.stringify({ ...defaultProfile, ...change })); assert.throws(() => loadProfile(file));
   }
 });

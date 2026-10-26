@@ -21,7 +21,15 @@ export class Store extends EventEmitter {
     await fs.mkdir(this.dir(id), { recursive: true }); await this.save(run); return run;
   }
   async save(run: Manifest) { run.updatedAt = new Date().toISOString(); await atomicJson(path.join(this.dir(run.id), 'manifest.json'), run); }
-  async get(id: string): Promise<Manifest> { return JSON.parse(await fs.readFile(path.join(this.dir(id), 'manifest.json'), 'utf8')); }
+  // Docker Desktop's macOS file sharing does not make save()'s rename-over atomic for readers: a read racing a save can
+  // briefly find no manifest (or a partial one), so retry for a moment before reporting the run as missing.
+  async get(id: string): Promise<Manifest> {
+    const file = path.join(this.dir(id), 'manifest.json');
+    for (let attempt = 1; ; attempt++) {
+      try { return JSON.parse(await fs.readFile(file, 'utf8')); }
+      catch (e) { if (attempt >= 20 || !((e as NodeJS.ErrnoException).code === 'ENOENT' || e instanceof SyntaxError)) throw e; await new Promise(resolve => setTimeout(resolve, 25)); }
+    }
+  }
   async list(): Promise<Manifest[]> {
     const entries = await fs.readdir(path.join(this.root, 'runs')).catch(() => []);
     const values = await Promise.all(entries.map(id => this.get(id).catch(() => null)));

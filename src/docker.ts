@@ -43,7 +43,7 @@ export class Docker {
     const workerId = await this.imageId(this.config.workerImage);
     const toolchain = checked(await this.command(['run', '--rm', '--network', 'none', this.config.workerImage, 'rustc', '--version'], run, signal), 'Inspect worker Rust compiler');
     const lock = await fs.readFile(path.join(base, 'Cargo.lock'));
-    const key = hash(JSON.stringify({ base: run.baseSha, lock: hash(lock), workerId, toolchain: this.config.rustToolchain, profile: this.config.profile }));
+    const key = hash(JSON.stringify({ base: run.baseSha, lock: hash(lock), workerId, toolchain: this.config.rustToolchain, profile: { ...this.config.profile, agentNotes: undefined } })); // agent notes do not affect the baseline
     const image = `bugfix-cache:${key.slice(0, 24)}`;
     const cached = await this.command(['image', 'inspect', '--format', '{{.Id}}', image]);
     if (!cached.code) { run.image = image; run.imageId = cached.stdout.trim(); run.toolchain = toolchain; await this.store.event(run, 'cache', 'hit', 'Reusing controller-prepared baseline cache'); return; }

@@ -7,6 +7,8 @@ export interface RepositoryProfile {
   focusedTestPrefix: string[]; fastCheckIds: string[]; checks: Record<string, string[]>;
   // Upstream tests that cannot run against the read-only source mount, each with a recorded reason; reported, never silent.
   skipTests?: Record<string, string>;
+  // Repository testing conventions given to the agent (like a CLAUDE.md); trusted local configuration.
+  agentNotes?: string[];
 }
 const rustPath = /^[A-Za-z_][A-Za-z0-9_]*(?:::[A-Za-z_][A-Za-z0-9_]*)*$/;
 // Appends `--skip NAME` filters (full test paths) to a `cargo test` argv, adding the `--` separator when absent.
@@ -29,6 +31,7 @@ export function loadProfile(file = defaultProfilePath): RepositoryProfile {
   if (!argv(p.focusedTestPrefix) || !p.checks || !Object.keys(p.checks).length || !Object.values(p.checks).every(argv)) throw new Error('Check commands must be nonempty argument arrays');
   if (!Object.keys(p.checks).every(id => /^[a-z][a-z0-9-]{0,60}$/.test(id))) throw new Error('Invalid check identifier');
   if (!p.fastCheckIds?.every(id => !!p.checks[id])) throw new Error('Fast checks must reference configured check IDs');
+  if (p.agentNotes !== undefined && (!Array.isArray(p.agentNotes) || p.agentNotes.length > 20 || !p.agentNotes.every(n => typeof n === 'string' && n.length > 0 && n.length <= 1000))) throw new Error('agentNotes must be up to 20 non-empty strings');
   const skips = Object.entries(p.skipTests || {});
   if (!skips.every(([name, reason]) => rustPath.test(name) && name.includes('::') && typeof reason === 'string' && reason.trim().length >= 10)) throw new Error('skipTests entries must be qualified Rust test paths with a written reason');
   p.checks = Object.fromEntries(Object.entries(p.checks).map(([id, argv]) => [id, withSkips(argv, skips.map(([name]) => name))]));

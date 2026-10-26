@@ -15,7 +15,7 @@ export async function doctor(config: Config): Promise<DoctorResult[]> {
     const info = await fs.stat(file).catch(() => null);
     results.push({ name, ok: !!info?.isFile() && info.size > 10, detail: info?.isFile() && info.size > 10 ? 'Secret file exists (value not displayed)' : `Create ${file} with a token; do not paste it into logs/chat`, required });
   }
-  await check('GitHub secret (publisher only)', config.docker, ['run', '--rm', '--network', 'none', '--cap-drop', 'ALL', '--entrypoint', '/usr/bin/test', '--mount', `type=bind,source=${config.githubSecret},target=/run/secrets/github_token,readonly`, config.publisherImage, '-s', '/run/secrets/github_token'], false);
+  await check('GitHub secret (publisher container only)', config.docker, ['run', '--rm', '--network', 'none', '--cap-drop', 'ALL', '--entrypoint', '/usr/bin/test', '--mount', `type=bind,source=${config.githubSecret},target=/run/secrets/github_token,readonly`, config.publisherImage, '-s', '/run/secrets/github_token'], false);
   const modelOk = /^[^/\s]+\/[^\s]+$/.test(config.model) && !/REPLACE|YOUR_|placeholder/i.test(config.model);
   results.push({ name: 'OpenCode model', ok: modelOk, detail: modelOk ? config.model : 'Set BUGFIX_MODEL to the existing provider/model ID', required: true });
   const repos = await fs.readdir(config.repoRoot).catch(() => []);

@@ -19,7 +19,61 @@ async function jsonBody(req: http.IncomingMessage, max = 4_000_000): Promise<any
   for await (const chunk of req) { size += chunk.length; if (size > max) throw new Error('Request body is too large'); parts.push(chunk); }
   return JSON.parse(Buffer.concat(parts).toString('utf8') || '{}');
 }
-export async function createServer(config: Config, options: { recover?: boolean; providerRequest?: typeof fetch } = {}) {
+// The NVIDIA key and chat endpoint, shared by the run gateway and the direct chat API.
+async function providerKey(config: Config) {
+  const key = (await fs.readFile(config.nvidiaSecret, 'utf8')).trim();
+  if (!key || /\s/.test(key)) throw new Error('NVIDIA secret file is empty or invalid'); return key;
+}
+function providerEndpoint(config: Config) {
+  const target = new URL(config.providerBaseUrl.endsWith('/') ? config.providerBaseUrl : config.providerBaseUrl + '/');
+  if (target.protocol !== 'https:' || target.username || target.password) throw new Error('The NVIDIA endpoint must be a credential-free HTTPS URL');
+  return target.href.replace(/\/$/, '') + '/chat/completions';
+}
+class ProviderError extends Error { status: number; constructor(status: number, message: string) { super(message); this.status = status; } }
+// Direct model access (POST /api/chat), outside any repair run: a prompt (or a message list) goes to the configured
+// model, or another NVIDIA model ID. Like the run gateway it waits out every 429, retries 5xx/network failures 5 times
+// and retries a stream that goes silent; the caller cancels by disconnecting. Prompts and answers are not stored.
+async function chat(config: Config, input: any, signal: AbortSignal, providerRequest: typeof fetch = fetch, silenceMs = 300_000) {
+  const roles = ['system', 'user', 'assistant'];
+  const messages = Array.isArray(input?.messages) ? input.messages : typeof input?.prompt === 'string' && input.prompt.trim() ? [...(typeof input.system === 'string' && input.system ? [{ role: 'system', content: input.system }] : []), { role: 'user', content: input.prompt }] : [];
+  if (!messages.length || messages.length > 200 || !messages.every((m: any) => roles.includes(m?.role) && typeof m.content === 'string') || JSON.stringify(messages).length > 1_000_000) throw new Error('Provide a non-empty "prompt" (optionally "system"), or "messages": [{"role":"system|user|assistant","content":"..."}]');
+  const model = input.model === undefined ? config.model.slice(config.model.indexOf('/') + 1) : String(input.model);
+  if (!/^[A-Za-z0-9._-]+(?:\/[A-Za-z0-9._-]+)*$/.test(model)) throw new Error('Invalid model ID');
+  const body = { model, messages: messages.map((m: any) => ({ role: m.role, content: m.content })), max_tokens: Math.min(Number(input.max_tokens) || config.modelMaxOutput, config.modelMaxOutput), ...(Number.isFinite(input.temperature) ? { temperature: Number(input.temperature) } : {}), stream: true, stream_options: { include_usage: true } };
+  const key = await providerKey(config), endpoint = providerEndpoint(config);
+  for (let attempt = 0, failures = 0; ; attempt++) {
+    let problem = '', retryAfter: string | null = null, timer: NodeJS.Timeout | undefined; const idle = new AbortController();
+    const quiet = () => { clearTimeout(timer); timer = setTimeout(() => idle.abort(new Error(`Model provider sent nothing for ${silenceMs / 60000} minutes`)), silenceMs); };
+    try {
+      quiet();
+      const response = await providerRequest(endpoint, { method: 'POST', headers: { authorization: `Bearer ${key}`, 'content-type': 'application/json' }, body: JSON.stringify(body), signal: AbortSignal.any([signal, idle.signal]) });
+      if (response.status === 429 || (response.status >= 500 && ++failures <= 5)) { problem = `HTTP ${response.status}`; retryAfter = response.headers.get('retry-after'); await response.body?.cancel().catch(() => {}); }
+      else if (!response.ok || !response.body) throw new ProviderError(response.status, `Model provider returned HTTP ${response.status}: ${(await response.text().catch(() => '')).slice(0, 2000)}`);
+      else {
+        let answer = '', reasoning = '', finishReason = '', usage: unknown, buffer = ''; const decoder = new TextDecoder();
+        for await (const chunk of response.body) {
+          quiet(); buffer += decoder.decode(chunk, { stream: true }); let index: number;
+          while ((index = buffer.indexOf('\n')) >= 0) {
+            const line = buffer.slice(0, index).trim(); buffer = buffer.slice(index + 1);
+            if (!line.startsWith('data:') || line === 'data: [DONE]') continue;
+            let data: any; try { data = JSON.parse(line.slice(5)); } catch { continue; }
+            const choice = data.choices?.[0]; answer += choice?.delta?.content || ''; reasoning += choice?.delta?.reasoning_content || choice?.delta?.reasoning || '';
+            finishReason = choice?.finish_reason || finishReason; usage = data.usage || usage;
+          }
+        }
+        // Some models write their reasoning inline as <think>…</think> before the answer.
+        const think = /^\s*<think>([\s\S]*?)<\/think>\s*/.exec(answer); if (think) { reasoning += think[1]; answer = answer.slice(think[0].length); }
+        return { model, answer: answer.trim(), ...(reasoning.trim() ? { reasoning: reasoning.trim() } : {}), finishReason, usage };
+      }
+    } catch (error) {
+      if (signal.aborted || error instanceof ProviderError || ++failures > 5) throw error;
+      problem = String(error);
+    } finally { clearTimeout(timer); }
+    const seconds = Math.max(1, Math.min(30, retryAfter && Number.isFinite(Number(retryAfter)) ? Number(retryAfter) : 2 ** Math.min(attempt + 1, 5)));
+    console.error(`chat: model ${problem}; retrying in ${seconds}s`); await sleep(seconds * 1000, undefined, { signal });
+  }
+}
+export async function createServer(config: Config, options: { recover?: boolean; providerRequest?: typeof fetch; providerSilenceMs?: number } = {}) {
   await fs.mkdir(config.stateDir, { recursive: true, mode: 0o700 }); await fs.mkdir(config.repoRoot, { recursive: true });
   const tokenFile = path.join(config.stateDir, 'ui-token');
   const uiToken = (await fs.readFile(tokenFile, 'utf8').catch(() => '')).trim() || randomBytes(32).toString('hex');
@@ -48,25 +102,26 @@ export async function createServer(config: Config, options: { recover?: boolean;
         const input = await jsonBody(req); const filtered = filterProviderTools(context.run, input);
         const expectedModel = config.model.slice(config.model.indexOf('/') + 1);
         if (input.model !== expectedModel) return json(res, { error: 'Model ID does not match the recorded configuration' }, 400);
-        const key = (await fs.readFile(config.nvidiaSecret, 'utf8')).trim();
-        if (!key || /\s/.test(key)) throw new Error('NVIDIA secret file is empty or invalid');
+        const key = await providerKey(config), endpoint = providerEndpoint(config);
         // Per-request output is capped at the model's configured limit; total usage is only reported, never capped.
         const body = { ...filtered.body, max_tokens: Math.min(Number(input.max_tokens) || config.modelMaxOutput, config.modelMaxOutput) };
         await store.event(context.run, 'gateway', 'model_request', 'Approved outbound model tool list', { tools: filtered.names, removedTools: filtered.removed, model: input.model });
-        const target = new URL(config.providerBaseUrl.endsWith('/') ? config.providerBaseUrl : config.providerBaseUrl + '/');
-        if (target.protocol !== 'https:' || target.username || target.password) throw new Error('The NVIDIA endpoint must be a credential-free HTTPS URL');
         // One request lives until the run is cancelled or the agent disconnects (OpenCode then sends a new request).
         const request = new AbortController(); const stopRequest = () => request.abort(context.abort.signal.reason);
         context.abort.signal.addEventListener('abort', stopRequest, { once: true });
         res.on('close', () => { if (!res.writableEnded) request.abort(new Error('Agent disconnected from the model gateway')); });
+        // A provider that accepts a request but sends nothing (no response, or only keep-alives mid-answer) for 5 minutes
+        // is treated like a transient failure instead of holding the agent turn open indefinitely.
+        const silence = options.providerSilenceMs ?? 300_000; let idle = new AbortController(), idleTimer: NodeJS.Timeout | undefined;
+        const quiet = () => { clearTimeout(idleTimer); idleTimer = setTimeout(() => idle.abort(new Error(`Model provider sent nothing for ${silence / 60000} minutes`)), silence); };
         try {
           // Wait out rate limits (every 429) and transient provider/network failures (5xx or connection errors, 5 times) here
           // rather than hand them to OpenCode, whose own retries give up.
           let upstream: Response | undefined, failures = 0;
           for (let attempt = 0; ; attempt++) {
-            let problem = ''; upstream = undefined;
+            let problem = ''; upstream = undefined; idle = new AbortController(); quiet();
             try {
-              upstream = await (options.providerRequest || fetch)(target.href.replace(/\/$/, '') + '/chat/completions', { method: 'POST', headers: { authorization: `Bearer ${key}`, 'content-type': 'application/json' }, body: JSON.stringify(body), signal: request.signal });
+              upstream = await (options.providerRequest || fetch)(endpoint, { method: 'POST', headers: { authorization: `Bearer ${key}`, 'content-type': 'application/json' }, body: JSON.stringify(body), signal: AbortSignal.any([request.signal, idle.signal]) });
               if ([401, 403, 404].includes(upstream.status)) context.providerRejected = `HTTP ${upstream.status}`; // bad key or unknown model
               if (upstream.status === 429) problem = 'HTTP 429';
               else if (upstream.status >= 500 && ++failures <= 5) problem = `HTTP ${upstream.status}`;
@@ -86,7 +141,9 @@ export async function createServer(config: Config, options: { recover?: boolean;
           let buffer = '', used = 0; const decoder = new TextDecoder();
           try {
             for await (const chunk of upstream.body) {
-              res.write(chunk); buffer += decoder.decode(chunk, { stream: true });
+              const text = decoder.decode(chunk, { stream: true });
+              if (/^data:\s*\S/m.test(text)) quiet(); // real output, not a keep-alive comment
+              res.write(chunk); buffer += text;
               let index: number;
               while ((index = buffer.indexOf('\n')) >= 0) {
                 const line = buffer.slice(0, index).replace(/^data:\s*/, '').trim(); buffer = buffer.slice(index + 1);
@@ -95,7 +152,7 @@ export async function createServer(config: Config, options: { recover?: boolean;
               if (buffer.length > 1_000_000) buffer = buffer.slice(-100000);
             }
           } catch (error) {
-            // A broken stream must reach OpenCode as a transport error, not as a silently truncated (retry-less) answer.
+            // A broken or silent stream must reach OpenCode as a transport error, not as a silently truncated answer.
             await store.event(context.run, 'gateway', 'model_error', `Model stream interrupted: ${String(error)}`); return res.destroy();
           }
           try { const data = JSON.parse(buffer); used = Math.max(used, Number(data.usage?.total_tokens || 0)); } catch {}
@@ -103,7 +160,7 @@ export async function createServer(config: Config, options: { recover?: boolean;
           await store.save(context.run);
           await store.event(context.run, 'gateway', upstream.ok ? 'model_finished' : 'model_error', `Model HTTP ${upstream.status}; reported tokens ${used}`);
           return res.end();
-        } finally { context.abort.signal.removeEventListener('abort', stopRequest); }
+        } finally { clearTimeout(idleTimer); context.abort.signal.removeEventListener('abort', stopRequest); }
       }
       const browserOrigin = req.headers.origin;
       if (browserOrigin && new URL(browserOrigin).host !== req.headers.host) return json(res, { error: 'Cross-origin requests are not permitted' }, 403);
@@ -120,6 +177,11 @@ export async function createServer(config: Config, options: { recover?: boolean;
       }
       if (url.pathname === '/api/status' && req.method === 'GET') return json(res, { model: config.model, repoRoot: config.repoRoot, profile: config.profile, configuredFork: config.fork, active: [...pipeline.contexts.keys()], version: '0.1.0' });
       if (url.pathname === '/api/doctor' && req.method === 'GET') return json(res, await doctor(config));
+      if (url.pathname === '/api/chat' && req.method === 'POST') {
+        const request = new AbortController(); res.on('close', () => { if (!res.writableEnded) request.abort(new Error('Client disconnected')); });
+        try { return json(res, await chat(config, await jsonBody(req), request.signal, options.providerRequest, options.providerSilenceMs)); }
+        catch (error) { if (error instanceof ProviderError) return json(res, { error: error.message, providerStatus: error.status }, 502); throw error; }
+      }
       if (url.pathname === '/api/runs' && req.method === 'GET') return json(res, await store.list());
       if (url.pathname === '/api/runs' && req.method === 'POST') return json(res, await pipeline.start(await jsonBody(req)), 202);
       if (url.pathname === '/api/demo' && req.method === 'POST') return json(res, await demo(store, config.profile), 202);
@@ -139,19 +201,29 @@ export async function createServer(config: Config, options: { recover?: boolean;
         if (action === 'events' && req.method === 'GET') {
           res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive', 'x-accel-buffering': 'no' });
           let last = Number(req.headers['last-event-id'] || url.searchParams.get('after') || 0); if (!Number.isSafeInteger(last) || last < 0) last = 0;
-          let replaying = true; const queued: RunEvent[] = [];
-          const send = (event: RunEvent) => { if (event.seq <= last) return; last = event.seq; res.write(`id: ${event.seq}\ndata: ${JSON.stringify(event)}\n\n`); if (res.writableLength > 2_000_000) res.destroy(); };
-          const listener = (event: RunEvent) => { if (replaying) queued.push(event); else send(event); };
+          // Replay and live events share one ordered queue that waits for 'drain' whenever the socket buffer is full, so a
+          // long run's backlog streams instead of being dropped (a fixed 2 MB cap here used to kill every replay).
+          let loading = true, pumping = false, closed = false; const pending: RunEvent[] = [], live: RunEvent[] = [];
+          const pump = async () => {
+            if (pumping || loading) return; pumping = true;
+            while (pending.length && !closed) {
+              const event = pending.shift()!; if (event.seq <= last) continue; last = event.seq;
+              if (!res.write(`id: ${event.seq}\ndata: ${JSON.stringify(event)}\n\n`)) await new Promise<void>(resolve => { const done = () => { res.off('drain', done); res.off('close', done); resolve(); }; res.on('drain', done); res.on('close', done); });
+            }
+            pumping = false;
+          };
+          const listener = (event: RunEvent) => { if (loading) live.push(event); else { pending.push(event); void pump(); } };
           store.on(id, listener);
-          for (const event of await store.events(id, last)) send(event); replaying = false; for (const event of queued) send(event);
-          const ping = setInterval(() => res.write(': heartbeat\n\n'), 15000);
-          req.on('close', () => { clearInterval(ping); store.off(id, listener); }); return;
+          const ping = setInterval(() => { if (!pumping) res.write(': heartbeat\n\n'); }, 15000);
+          req.on('close', () => { closed = true; clearInterval(ping); store.off(id, listener); });
+          pending.push(...await store.events(id, last), ...live); loading = false; void pump(); return;
         }
       }
       const assets: Record<string, [string, string]> = { '/': ['index.html', 'text/html'], '/app.js': ['app.js', 'text/javascript'], '/style.css': ['style.css', 'text/css'] };
       if (assets[url.pathname] && req.method === 'GET') {
         const [file, mime] = assets[url.pathname]; res.writeHead(200, { 'content-type': `${mime}; charset=utf-8`, 'cache-control': 'no-store', 'content-security-policy': "default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'", 'x-content-type-options': 'nosniff', 'referrer-policy': 'no-referrer' }); return res.end(await fs.readFile(path.join(publicDir, file)));
       }
+      if (url.pathname === '/favicon.ico') { res.writeHead(204); return res.end(); }
       return json(res, { error: 'Not found' }, 404);
     } catch (error) {
       if (!res.headersSent) json(res, { error: error instanceof Error ? error.message : String(error) }, 400); else res.end();

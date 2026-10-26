@@ -37,6 +37,17 @@ export async function freezeRegression(base: string, source: string, spec: Regre
   if (changedFiles(oldFiles, newFiles).some(p => !allowed.has(p))) throw new Error('Reproduction modified implementation, existing fixtures, or unrelated files');
   return { spec, ...freezeRust(after, local), fixtureHashes, overlayHash: hash(JSON.stringify(changedFiles(oldFiles, newFiles).map(p => [p, newFiles[p]]))) };
 }
+// During reproduction an edit may only insert: when its `before` text is original code, `after` must be that text with
+// new code inserted at one point (often between two existing tests). Text that is not in the original file belongs to
+// the agent's own new test and may change freely.
+export function assertInsertOnly(original: string, edit: { path: string; before: string; after: string }) {
+  const { before, after } = edit;
+  if (!before || !original.includes(before)) return;
+  let prefix = 0, suffix = 0;
+  while (prefix < before.length && before[prefix] === after[prefix]) prefix++;
+  while (suffix < before.length && suffix < after.length && before[before.length - 1 - suffix] === after[after.length - 1 - suffix]) suffix++;
+  if (after.length < before.length || prefix + suffix < before.length) throw new Error(`During reproduction apply_patch may only ADD code, but this edit changes or removes original text in ${edit.path}. Keep the whole "before" text unchanged in "after" and insert the new test at one point inside or around it.`);
+}
 export async function assertFrozen(root: string, frozen: FrozenRegression) {
   const source = await fs.readFile(await sourcePath(root, frozen.spec.file), 'utf8');
   const actual = freezeRust(source, inFileTestName(frozen.spec));

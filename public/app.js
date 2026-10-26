@@ -21,7 +21,7 @@ function flushLog() {
   if (atBottom) logNode.scrollTop = logNode.scrollHeight;
 }
 function queueLog(event) { pending.push(event); if (!frame) frame = requestAnimationFrame(flushLog); }
-const stages = ['preflight','environment','discovery','reproduction','patching','verification','publishing'];
+const stages = ['preflight','environment','discovery','reproduction','patching','review','verification','publishing'];
 const label = value => String(value || '').replaceAll('_',' ');
 const element = (tag, text, cls) => { const node = document.createElement(tag); if (text !== undefined) node.textContent = text; if (cls) node.className = cls; return node; };
 async function api(url, options) { const response = await fetch(url, options); const data = await response.json(); if (!response.ok) throw Error(data.error || response.statusText); return data; }
@@ -35,6 +35,7 @@ async function refresh() {
     button.onclick = () => choose(run.id); list.append(button);
   }
   if (selected) { const latest = runs.find(r => r.id === selected.id); if (latest) { selected = latest; render(); } }
+  error('');
 }
 async function choose(id) {
   stream?.close(); events = []; resetLog(); selected = await api(`/api/runs/${id}`); render(); await refresh();
@@ -62,7 +63,7 @@ function render() {
   if (run.publication?.error) detail.append(element('div',`Draft PR not created: ${run.publication.error}`,'banner warning'));
   if (run.publication?.url) { const banner = element('div',undefined,'banner'); banner.append(element('span','Draft PR created · ')); const link = element('a',run.publication.url); link.href = run.publication.url; link.target = '_blank'; link.rel = 'noopener noreferrer'; banner.append(link); detail.append(banner); }
   const steps = element('div',undefined,'steps'), current = stages.indexOf(run.stage);
-  for (let i = 0; i < stages.length; i++) steps.append(element('div',label(stages[i]),'step ' + (i === current ? 'current' : i < current || run.stage === 'complete' && i <= (run.outcome === 'draft_created' ? 6 : ['verified_patch','demo_complete','verified_unpublished'].includes(run.outcome) ? 5 : -1) ? 'done' : '')));
+  for (let i = 0; i < stages.length; i++) steps.append(element('div',label(stages[i]),'step ' + (i === current ? 'current' : i < current || run.stage === 'complete' && i <= (run.outcome === 'draft_created' ? stages.indexOf('publishing') : ['verified_patch','demo_complete','verified_unpublished'].includes(run.outcome) ? stages.indexOf('verification') : -1) ? 'done' : '')));
   detail.append(steps);
   const metrics = element('div',undefined,'metrics');
   const elapsed = Math.max(0, Math.round((Date.parse(run.outcome ? run.updatedAt : new Date().toISOString()) - Date.parse(run.createdAt))/1000));

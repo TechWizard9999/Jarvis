@@ -3,6 +3,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { loadConfig } from './config.ts';
 import { createServer } from './server.ts';
+import { RunFailure } from './pipeline.ts';
 import { doctor } from './doctor.ts';
 const config = loadConfig();
 const [command = 'help', ...argv] = process.argv.slice(2);
@@ -30,7 +31,9 @@ try {
   if (command === 'serve') {
     const app = await createServer(config); await new Promise<void>(resolve => app.server.listen(config.port, config.bind, resolve));
     console.log(`RTK Bugfix Agent: http://localhost:${config.port}/?token=${app.uiToken}`);
-    const stop = async () => { for (const id of app.pipeline.contexts.keys()) await app.pipeline.cancel(id).catch(() => {}); app.server.close(() => process.exit(0)); };
+    // A controller stop (./bugfix up rebuild, down, Docker restart) ends active runs; say so instead of "cancelled by user".
+    const stopped = () => new RunFailure('interrupted', 'The controller was stopped (rebuild, restart or ./bugfix down) while this run was active. Evidence is preserved; start the run again.');
+    const stop = async () => { for (const id of app.pipeline.contexts.keys()) await app.pipeline.cancel(id, stopped()).catch(() => {}); app.server.close(() => process.exit(0)); };
     process.on('SIGTERM', stop); process.on('SIGINT', stop);
   } else if (command === 'doctor') {
     const checks = await doctor(config); for (const c of checks) console.log(`${c.ok ? 'PASS' : c.required ? 'FAIL' : 'NOTE'} ${c.name}: ${c.detail}`); if (checks.some(c => c.required && !c.ok)) process.exitCode = 1;
@@ -47,9 +50,18 @@ try {
     if (run.publication?.url) console.log(`Draft PR: ${run.publication.url}`); else if (run.publication?.error) console.log(`Publication error: ${run.publication.error}`);
     // Success means the requested result exists: a draft PR when publishing, otherwise a verified patch.
     if (argv.includes('--no-publish') ? !['verified_patch', 'verified_unpublished', 'draft_created'].includes(run.outcome) : !run.publication?.url) process.exitCode = 1;
+  } else if (command === 'ask') {
+    // Direct model call outside any run: ask "PROMPT" [--system TEXT] [--model ID] [--max-tokens N] [--reasoning] [--json]; a prompt of "-" is read from stdin.
+    const values = new Set(['--system', '--model', '--max-tokens'].flatMap(name => { const i = argv.indexOf(name); return i < 0 ? [] : [i, i + 1]; }));
+    let prompt = argv.filter((a, i) => !values.has(i) && !a.startsWith('--')).join(' ');
+    if (prompt === '-') { prompt = ''; for await (const chunk of process.stdin) prompt += chunk; }
+    if (!prompt.trim()) throw new Error('Usage: ask "PROMPT" [--system TEXT] [--model ID] [--max-tokens N] [--reasoning] [--json]   (use - to read the prompt from stdin)');
+    const result = await (await api('/api/chat', 'POST', { prompt, system: option('--system'), model: option('--model'), max_tokens: option('--max-tokens') ? Number(option('--max-tokens')) : undefined })).json() as any;
+    if (argv.includes('--json')) console.log(JSON.stringify(result, null, 2));
+    else { if (argv.includes('--reasoning') && result.reasoning) console.log(`--- reasoning ---\n${result.reasoning}\n--- answer ---`); console.log(result.answer); }
   } else if (command === 'demo') console.log(JSON.stringify(await (await api('/api/demo', 'POST')).json(), null, 2));
   else if (command === 'list') console.log(JSON.stringify(await (await api('/api/runs')).json(), null, 2));
   else if (command === 'cancel' || command === 'publish') console.log(JSON.stringify(await (await api(`/api/runs/${argv[0]}/${command}`, 'POST')).json(), null, 2));
   else if (command === 'tail') await follow(argv[0]);
-  else console.log('Commands: serve, doctor, fix ISSUE_URL [--no-publish], run --repo PATH --issue URL [--publish] [--mode evaluation --base SHA --no-publish], list, tail ID, cancel ID, publish ID, demo. Use ./bugfix for Docker setup/build/up/clone commands.');
+  else console.log('Commands: serve, doctor, ask "PROMPT" [--system TEXT] [--model ID] [--json], fix ISSUE_URL [--no-publish], run --repo PATH --issue URL [--publish] [--mode evaluation --base SHA --no-publish], list, tail ID, cancel ID, publish ID, demo. Use ./bugfix for Docker setup/build/up/clone commands.');
 } catch (e) { console.error(e instanceof Error ? e.message : String(e)); process.exitCode = 1; }

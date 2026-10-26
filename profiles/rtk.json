@@ -75,5 +75,9 @@
   },
   "skipTests": {
     "hooks::init::pi::tests::test_global_uninstall_detects_shared_pi_omp_extension": "Creates a relative .omp directory in the crate root (fs::create_dir_all(OMP_LOCAL_DIR) in src/hooks/init/pi.rs), which the read-only source mount forbids; it passes in upstream CI, where the checkout is writable."
-  }
+  },
+  "agentNotes": [
+    "In unit tests, user_dirs::working_dir() returns None unless the test enters a scratch directory, so project-level discovery (for example .claude/settings.json, .codex/rules or other files found by walking up from the working directory) sees nothing. A test that writes project files must create them under test_isolation::project() inside test_isolation::with_root(...) and call `let _entered = test_isolation::enter(&project);` before invoking the code under test; otherwise no fix can ever make it pass.",
+    "Copy the setup of an existing passing test in the same module (search for test_isolation::enter) rather than inventing new isolation code."
+  ]
 }

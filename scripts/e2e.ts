@@ -22,7 +22,7 @@ class ScriptedAgent implements RepairAgent {
   toolToken = 'fixture-tools'; providerToken = 'fixture-provider'; run: Manifest; turn = 0; sourceEvidence = 0; testEvidence = 0; refuse = false;
   constructor(run: Manifest, refuse = false) { this.run = run; this.refuse = refuse; }
   async start() {} async stop() {}
-  async ask() {
+  async ask(prompt = '') {
     if (this.refuse) return { status: 'cannot_reproduce', reason: 'Deliberate unsupported fixture case' };
     if (this.turn++ === 0) {
       if (this.run.input.retrieval === 'graph') {
@@ -42,8 +42,13 @@ class ScriptedAgent implements RepairAgent {
       const search = await engine.tool(this.run.id, 'search_text', { pattern: 'preserve', path: 'src', reason: 'Graph is stale after the protected regression insertion' });
       assert.match((search.result as { output: string }).output, /src\/lib.rs/);
       const check = await engine.tool(this.run.id, 'run_check', { check: 'test-focused', test: testName }); this.testEvidence = check.evidenceId;
-      return { status: 'reproduced', regression: spec };
+      return { status: 'reproduced', regression: { ...spec, examples: ['The error line must be preserved.'] } };
     }
+    if (prompt.includes('code REVIEWER')) {
+      assert.equal(this.run.stage, 'review'); await assert.rejects(engine.tool(this.run.id, 'apply_patch', { edits: [] }), /read-only/);
+      return { examples: [{ example: 'The error line must be preserved.', expectedOutput: 'error: line kept', actualOutputWithPatch: 'error: line kept', matches: true, evidence: 'src/lib.rs:1' }], invariantEnforced: true, invariantNote: 'Every non-empty line is kept.', probes: [], gaps: [] };
+    }
+    if (prompt.includes('FINAL verified diff')) { assert.match(prompt, /is_empty/); return { title: 'fix(fixture): keep error lines in output', explanation: 'The predicate excluded error-prefixed lines; the verified diff keeps every non-empty line. Scripted integration fixture.' }; }
     await engine.tool(this.run.id, 'apply_patch', { edits: [{ path: 'src/lib.rs', before: '!line.starts_with("error:")', after: '!line.is_empty()' }] });
     return { explanation: 'The predicate excluded error-prefixed lines. Preserve non-empty output so the reported error and existing normal output are retained. This is a scripted integration fixture, not a model-generated RTK fix.', evidenceIds: [this.sourceEvidence, this.testEvidence], snapshots: [] };
   }
@@ -54,7 +59,9 @@ console.log(`Real Docker integration run: ${success.id}`);
 store.on(success.id, event => { if (['stage','outcome','error','candidate_rejected','repro_rejected'].includes(event.kind)) console.log(`[${event.stage}] ${event.message}`); });
 await engine.execute(success);
 assert.equal(success.outcome, 'verified_patch', success.error || 'Expected independently verified fixture patch');
-assert.ok(success.verifiedCommit); assert.ok(success.verifiedTree);
+assert.ok(success.verifiedCommit); assert.ok(success.verifiedTree); assert.equal(success.summary?.title, 'fix(fixture): keep error lines in output');
+assert.equal(success.review?.passed, true, 'Expected the independent review to pass');
+assert.deepEqual((await store.events(success.id)).filter(e => e.kind === 'stage').map(e => e.stage).filter((s, i, all) => s !== all[i - 1]), ['preflight', 'environment', 'discovery', 'reproduction', 'patching', 'review', 'verification']);
 assert.equal(await fs.readFile(path.join(repo, 'src/lib.rs'), 'utf8'), original, 'Original checkout changed');
 assert.equal(success.checks.filter(c => c.id.startsWith('repro-') && c.exitCode !== 0).length, 3);
 assert.ok(success.checks.some(c => c.id.startsWith('independent-baseline-regression') && c.exitCode !== 0));
