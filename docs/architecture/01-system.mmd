@@ -1,0 +1,60 @@
+flowchart TB
+  U["Developer"]
+  UI["Local browser dashboard"]
+  CLI["./bugfix CLI + Mac-awake wrapper"]
+  subgraph HOST["Your Mac and Docker Desktop"]
+    subgraph CTRL["Trusted controller container · Node 24 · port 3210"]
+      API["HTTP API / authentication"]
+      P["Pipeline orchestrator + policy gates"]
+      G["Model gateway / phase settings / retries"]
+      T["Eight-tool bridge / serialized execution"]
+      S["Store + transcript + reports"]
+      API --> P
+      P --> S
+      T --> P
+    end
+    D["Docker engine / socket"]
+    R["Local Git clone + isolated worktree"]
+    F[("Private state/runs/ID<br/>snapshots, events, checks, bundles")]
+    OC["OpenCode 1.19.3 container<br/>No repository mount / native tools disabled"]
+    B["Dependency fetch + trusted baseline cache"]
+    W["Offline worker<br/>Graphify, search, Cargo checks"]
+    FM["Offline formatter<br/>Private writable source copy"]
+    V["Fresh offline baseline + candidate verifiers"]
+    PB["One-shot publisher<br/>Verified bundle + GitHub token"]
+    P -->|Docker CLI| D
+    D -.-> OC
+    D -.-> B
+    D -.-> W
+    D -.-> FM
+    D -.-> V
+    D -.-> PB
+    P --> R
+    R -->|export source without .git| F
+    S <--> F
+    P -->|phase prompts / session control| OC
+    OC <-->|generation requests / model stream| G
+    OC -->|authenticated tool calls| T
+    T --> W
+    T --> FM
+    P --> V
+    B -->|pinned baseline image| W
+    B -->|pinned baseline image| V
+    F -->|read-only source| W
+    F -->|read-only verification copies| V
+    F -->|run artifacts / verified Git bundle| PB
+    S -->|durable activity SSE via API| UI
+    S -->|durable activity SSE via API| CLI
+  end
+  N["NVIDIA hosted inference<br/>Selected Ultra OR Lightning model"]
+  GH["GitHub upstream<br/>Issue, competing PRs, develop"]
+  DEST["Personal fork branch<br/>Upstream draft PR"]
+  DEP["Cargo dependency sources"]
+  U --> UI
+  U --> CLI
+  UI --> API
+  CLI --> API
+  G <-->|HTTPS / real NVIDIA key| N
+  P -->|API auth / public Git fetch| GH
+  B -->|fetch phase only| DEP
+  PB -->|push exact commit / create or reconcile draft| DEST

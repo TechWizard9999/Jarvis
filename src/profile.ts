@@ -9,6 +9,7 @@ export interface RepositoryProfile {
   skipTests?: Record<string, string>;
   // Repository testing conventions given to the agent (like a CLAUDE.md); trusted local configuration.
   agentNotes?: string[];
+  skipTestOwners?: Record<string, string[]>;
 }
 const rustPath = /^[A-Za-z_][A-Za-z0-9_]*(?:::[A-Za-z_][A-Za-z0-9_]*)*$/;
 // Appends `--skip NAME` filters (full test paths) to a `cargo test` argv, adding the `--` separator when absent.
@@ -34,6 +35,7 @@ export function loadProfile(file = defaultProfilePath): RepositoryProfile {
   if (p.agentNotes !== undefined && (!Array.isArray(p.agentNotes) || p.agentNotes.length > 20 || !p.agentNotes.every(n => typeof n === 'string' && n.length > 0 && n.length <= 1000))) throw new Error('agentNotes must be up to 20 non-empty strings');
   const skips = Object.entries(p.skipTests || {});
   if (!skips.every(([name, reason]) => rustPath.test(name) && name.includes('::') && typeof reason === 'string' && reason.trim().length >= 10)) throw new Error('skipTests entries must be qualified Rust test paths with a written reason');
+  for (const [name, owners] of Object.entries(p.skipTestOwners || {})) { if (!p.skipTests?.[name] || !Array.isArray(owners) || !owners.length) throw new Error('Skipped test owners must reference a declared skip'); owners.forEach(safeRelative); }
   p.checks = Object.fromEntries(Object.entries(p.checks).map(([id, argv]) => [id, withSkips(argv, skips.map(([name]) => name))]));
   return p;
 }

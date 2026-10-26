@@ -12,9 +12,9 @@ async function save(value){await fs.writeFile(output+'.tmp',JSON.stringify(value
 try {
   input=JSON.parse(await fs.readFile('/artifacts/publication-input.json','utf8'));
   const repo = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
-  if(!repo.test(input.fork) || !repo.test(input.upstream) || input.fork.toLowerCase()===input.upstream.toLowerCase() || !/^fix\/issue-[0-9]+-[a-z0-9-]+$/.test(input.branch) || !/^[a-f0-9]{40,64}$/.test(input.commit) || !/^[a-f0-9]{40,64}$/.test(input.tree) || !/^[A-Za-z0-9_./-]+$/.test(input.base) || input.base.includes('..') || input.base.startsWith('-') || !Number.isSafeInteger(input.issue) || input.issue<1)throw Error('Invalid publication identity');
-  // The title comes from the model's summary of the verified diff: one printable line, else the generic subject.
-  const title=typeof input.title==='string' && /^[^\x00-\x1f\x7f-][^\x00-\x1f\x7f]{0,99}$/.test(input.title) ? input.title : `fix: resolve issue #${input.issue}`;
+  if(!repo.test(input.fork) || !repo.test(input.upstream) || !/^fix\/issue-[0-9]+-[a-z0-9-]+$/.test(input.branch) || !/^[a-f0-9]{40,64}$/.test(input.commit) || !/^[a-f0-9]{40,64}$/.test(input.tree) || !/^[A-Za-z0-9_./-]+$/.test(input.base) || input.base.includes('..') || input.base.startsWith('-') || !Number.isSafeInteger(input.issue) || input.issue<1)throw Error('Invalid publication identity');
+  // Only a single printable title is accepted; bind it to the option so it cannot be parsed as a flag.
+  const title=typeof input.title==='string' && /^[^\x00-\x1f\x7f-][^\x00-\x1f\x7f]{0,119}$/.test(input.title) ? input.title : `fix: resolve issue #${input.issue}`;
   process.env.GH_TOKEN=(await fs.readFile('/run/secrets/github_token','utf8')).trim();
   process.env.GH_PROMPT_DISABLED='1';process.env.GIT_TERMINAL_PROMPT='0';process.env.GIT_CONFIG_NOSYSTEM='1';process.env.GIT_CONFIG_GLOBAL='/dev/null';
   command('gh',['api','user']);
@@ -42,7 +42,8 @@ try {
   const remoteHead=git(['ls-remote','--heads',remote,`refs/heads/${input.branch}`]);
   if(remoteHead && remoteHead.split(/\s+/)[0]!==input.commit)throw Error('Remote branch has different content; refusing to overwrite it');
   git(['push',remote,`HEAD:refs/heads/${input.branch}`]);
-  const url=command('gh',['pr','create','--draft','--repo',input.upstream,'--base',input.base,'--head',`${owner}:${input.branch}`,`--title=${title}`,'--body-file','/publish/body.md']);
+  const head=input.fork.toLowerCase()===input.upstream.toLowerCase()?input.branch:`${owner}:${input.branch}`;
+  const url=command('gh',['pr','create','--draft','--repo',input.upstream,'--base',input.base,'--head',head,`--title=${title}`,'--body-file','/publish/body.md']);
   const pr=JSON.parse(command('gh',['api',`repos/${input.upstream}/pulls/${url.split('/').at(-1)}`]));
   if(pr.head.sha!==input.commit || !pr.draft || pr.base.ref!==input.base || pr.head.repo.full_name.toLowerCase()!==input.fork.toLowerCase())throw Error('Created PR metadata differs from the verified publication identity');
   await save({url:pr.html_url,commit:pr.head.sha,draft:true});console.log(pr.html_url);

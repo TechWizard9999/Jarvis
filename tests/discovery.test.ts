@@ -1,0 +1,21 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import fs from 'node:fs/promises';
+import path from 'node:path';
+import { Pipeline } from '../src/pipeline.ts';
+import { tempConfig } from './helpers.ts';
+test('controller exposes filtered test discovery and preserves no-match verdict with suggestions', async t => {
+  const {root,config}=await tempConfig();t.after(()=>fs.rm(root,{recursive:true,force:true}));
+  const pipeline=new Pipeline(config),run=await pipeline.store.create({repo:'/repo',issue:'https://github.com/rtk-ai/rtk/issues/1',mode:'evaluation'});
+  run.stage='reproduction';run.workerContainer='fixture';const source=path.join(pipeline.store.dir(run.id),'source');await fs.mkdir(source,{recursive:true});
+  const name='cmds::python::sqlfluff_cmd::tests::json_output';
+  const catalog=Array.from({length:6000},(_,i)=>`module_${i}::tests::case: test`).join('\n')+`\n${name}: test\n`;
+  pipeline.docker.inContainer=async (_run,_container,argv)=>({code:0,stdout:argv.includes('--list')?catalog:argv[0]==='python3'?'':'test result: ok. 0 passed; 0 failed; 0 ignored; 6001 filtered out;',stderr:'',durationMs:1,timedOut:false});
+  pipeline.contexts.set(run.id,{run,source,base:source,phase:'reproduction',abort:new AbortController(),queue:Promise.resolve(),agent:{toolToken:'',providerToken:'',ask:async()=>({}),start:async()=>{},stop:async()=>{}}});
+  await assert.rejects(pipeline.tool(run.id,'read_source',{path:'/agent/src/lib.rs'}),/repository-relative/);
+  await assert.rejects(pipeline.tool(run.id,'run_check',{check:'test-module',target:'module::tests'}),/requires.*test.*target/i);
+  const listing=await pipeline.tool(run.id,'run_check',{check:'list-tests',test:'sqlfluff'}) as any;
+  assert.deepEqual(listing.result.listedTests,[name]);assert.equal(listing.result.totalListed,6001);assert.ok(listing.result.output.length<200);
+  const probe=await pipeline.tool(run.id,'run_check',{check:'test-focused',test:'sqlfluff_cmd::tests'}) as any;
+  assert.equal(probe.result.status,'no_match');assert.equal(probe.result.matched,0);assert.deepEqual(probe.result.suggestedTests,[name]);
+});

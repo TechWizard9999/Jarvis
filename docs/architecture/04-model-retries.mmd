@@ -1,0 +1,27 @@
+sequenceDiagram
+  autonumber
+  participant P as Pipeline.askAgent
+  participant O as OpenCode 1.19.3
+  participant G as Controller gateway
+  participant N as NVIDIA endpoint
+  P->>O: Phase prompt / one active turn
+  loop OpenCode generation retry (observed six requests per failed turn)
+    O->>G: Logical streaming chat request
+    G->>N: Initial outbound attempt
+    alt HTTP 429
+      N-->>G: Throttled
+      loop While HTTP 429 and request is not aborted
+        Note over G: Honor Retry-After, else 2/4/8/16/30 seconds
+        G->>N: Retry outbound attempt
+        N-->>G: Next status / eventual response stream
+      end
+    else HTTP 200 stream
+      N-->>G: Response frames, possibly an embedded error 500
+    end
+    G-->>O: Forward response bytes as they arrive
+    Note over G: BUG at clean EOF: HTTP 200 is marked completed<br/>Structured stream error is not classified
+    Note over O: Recognize embedded error / back off
+  end
+  O-->>P: Terminal model error after SDK retries
+  Note over P: Retry whole turn after 5/10/.../60 seconds<br/>Restart OpenCode every third failure<br/>No repeated-provider-error circuit breaker
+  P->>O: Repeat phase prompt

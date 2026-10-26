@@ -1,0 +1,38 @@
+flowchart TD
+  START["Start one live repair"]
+  PRE["Preflight<br/>Issue, competing PRs, identity, clean clone, images"]
+  SNAP["Pin upstream base<br/>Create worktree + base/source snapshots"]
+  CACHE["Prepare or reuse trusted baseline image<br/>Locked dependency fetch; baseline checks offline"]
+  GRAPH["Graphify original source<br/>Start controlled OpenCode session"]
+  PLAN["Freeze issue-cited acceptance matrix<br/>Bug scenarios + passing controls"]
+  REP["Model adds new tests / fixtures only"]
+  RAW["Preserve submitted source and answer"]
+  FMT["Guarded Cargo formatting in temporary copy"]
+  ADM["Admission: existing checks and controls pass<br/>Only exact new expected failures excluded"]
+  BASE["Repeat exact baseline scenarios 3 times<br/>Intended assertion failures + passing controls"]
+  CRIT["Fresh read-only coverage review<br/>Clauses, assertions, current read invocation + result"]
+  FREEZE["Persist frozen regression snapshot / hashes"]
+  PATCH["Model changes implementation only<br/>Current changed-source read + exact bug-test proof"]
+  FAST["Policy + fast checks + all acceptance scenarios"]
+  VER["Lock tools and stop worker<br/>Fresh baseline / candidate verifiers<br/>All configured profile checks + hashes"]
+  AUTHOR{"Author identity configured?"}
+  COMMIT["One signed-off commit<br/>Exact verified tree / frozen personal identity / bundle"]
+  PUB{"Publish requested?"}
+  PUSH["Reconcile remote state<br/>Push verified fork branch / create draft PR"]
+  DONE["Terminal outcome + cleanup<br/>Evidence and reports retained"]
+  STOP["Cancel / needs attention / environment or scope blocker"]
+  START --> PRE --> SNAP --> CACHE --> GRAPH --> PLAN --> REP --> RAW --> FMT --> ADM --> BASE --> CRIT --> FREEZE --> PATCH --> FAST --> VER --> AUTHOR
+  AUTHOR -->|yes| COMMIT --> PUB
+  AUTHOR -->|no identity / local patch only| DONE
+  PUB -->|yes| PUSH --> DONE
+  PUB -->|no| DONE
+  ADM -->|reject; at most 6 reproduction attempts| REP
+  BASE -->|wrong failure / nondeterminism| REP
+  CRIT -->|coverage or witness gap| REP
+  FAST -->|preserve candidate / reset to frozen tests| PATCH
+  VER -->|candidate failure / fresh session| PATCH
+  VER -->|Docker fault / bounded harness retries| VER
+  PATCH -->|repeated unchanged verdict or recognized immutable offender| STOP
+  RAW -->|storage failure; source retained| STOP
+  CRIT -->|artifact storage failure; source retained| STOP
+  START -.cancel in any phase.-> STOP --> DONE

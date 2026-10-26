@@ -1,21 +1,39 @@
 export type Stage = 'queued' | 'preflight' | 'environment' | 'discovery' | 'reproduction' | 'patching' | 'review' | 'verification' | 'publishing' | 'complete';
-export type Outcome = 'draft_created' | 'verified_patch' | 'verified_unpublished' | 'cannot_reproduce' | 'environment_blocked' | 'verification_failed' | 'cancelled' | 'interrupted' | 'demo_complete';
-export interface RunInput { repo: string; issue: string; base?: string; mode?: 'live' | 'evaluation' | 'demo'; retrieval?: 'graph' | 'text'; publish?: boolean; }
+export type Outcome = 'draft_created' | 'verified_patch' | 'verified_unpublished' | 'cannot_reproduce' | 'environment_blocked' | 'verification_failed' | 'cancelled' | 'interrupted' | 'demo_complete' | 'needs_attention';
+export interface RunInput { repo: string; issue: string; base?: string; mode?: 'live' | 'evaluation' | 'demo'; retrieval?: 'graph' | 'text'; publish?: boolean; acceptance?: AcceptanceRequirement[]; allowCompeting?: boolean; }
 export interface Issue { url: string; number: number; title: string; body: string; }
-export interface CheckResult { id: string; argv: string[]; exitCode: number; durationMs: number; log: string; timedOut: boolean; }
+export interface CheckSummary { status: 'passed' | 'failed' | 'no_match' | 'timed_out'; matched?: number; passed?: number; failed?: number; ignored?: number; }
+export interface CheckResult { id: string; argv: string[]; exitCode: number; durationMs: number; log: string; timedOut: boolean; status?: CheckSummary['status']; matched?: number; passed?: number; failed?: number; ignored?: number; scenarioIds?: string[]; candidateRevision?: string; sourceHash?: string; stage?: Stage; attempt?: number; }
 export interface RunEvent { seq: number; runId: string; time: string; stage: Stage; source: string; kind: string; message: string; data?: unknown; }
-export interface Regression { file: string; testName: string; failureContains: string; expectedBehavior: string; citation: string; fixtures: string[]; examples?: string[]; citationVerified?: boolean; failureAdopted?: boolean; }
-export interface FrozenRegression { spec: Regression; functionHash: string; contextHash: string; fixtureHashes: Record<string, string>; overlayHash: string; }
+export type RegressionTarget = { kind: 'unit' } | { kind: 'integration'; name: string };
+export interface AcceptanceRequirement { id: string; expectedBehavior: string; citation: string; citationSource?: 'body' | 'title'; baseline: 'fail' | 'pass'; required?: boolean; target?: RegressionTarget; }
+export interface Regression { id?: string; required?: boolean; baseline?: 'fail' | 'pass'; target?: RegressionTarget; file: string; testName: string; failureContains: string; expectedBehavior: string; citation: string; citationSource?: 'body' | 'title'; fixtures: string[]; examples?: string[]; citationVerified?: boolean; failureAdopted?: boolean; }
+export interface FrozenRegression { spec: Regression; functionHash: string; contextHash: string; fixtureHashes: Record<string, string>; overlayHash: string; wholeFileHash?: string; fixtureInventory?: Record<string, string>; }
 export interface SnapshotUpdate { path: string; reason: string; owner: string; }
-export interface Candidate { explanation: string; evidenceIds: number[]; snapshots?: SnapshotUpdate[]; }
+export interface Candidate { explanation: string; evidenceIds: number[]; snapshots?: SnapshotUpdate[]; candidateRevision?: string; }
 export interface Review {
   examples: { example: string; expectedOutput: string; actualOutputWithPatch: string; matches: boolean; evidence?: string }[];
   invariantEnforced: boolean; invariantNote?: string; probes?: { input: string; output: string; ok: boolean }[]; gaps: string[];
 }
-// Reviewer outcome for the final candidate: `unresolved` lists problems still open after the review rounds ran out.
 export interface ReviewResult { rounds: number; passed: boolean; unresolved: string[]; verdict?: Review; }
+export type InterventionKind = 'guidance' | 'manual_fix' | 'harness_fix' | 'review';
+export interface Intervention { time: string; kind: InterventionKind; message: string; }
 export interface Manifest {
   review?: ReviewResult;
+  summary?: { title: string; explanation: string };
+  reproductionCycles?: number;
+  interventions?: Intervention[];
+  revision?: number; competingPullRequests?: string[];
+  publicationIdentity?: { fork: string; upstream: string; base: string; branch: string; author: { name: string; email: string }; committer: { name: string; email: string } };
+  commitProvenance?: { commit: string; tree: string; parents: string[]; author: { name: string; email: string }; committer: { name: string; email: string }; signoff: string };
+  regressions?: FrozenRegression[];
+  acceptancePlan?: AcceptanceRequirement[];
+  acceptanceReview?: { complete: boolean; missing: string[]; explanation: string };
+  executionStartedAt?: string; executionFinishedAt?: string; failureStage?: Stage;
+  stageTimes?: { stage: Stage; startedAt: string; finishedAt?: string }[];
+  agentImageId?: string; publisherImageId?: string; workerBaseImageId?: string;
+  runConfig?: { artifact: string; sha256: string };
+  modelRequests?: { providerError?: ProviderFailure; transportComplete?: boolean; semanticComplete?: boolean; outputDelivered?: boolean; attemptRecords?: ProviderAttemptRecord[]; id: string; startedAt: string; finishedAt?: string; latencyMs?: number; attempts: number; model: string; inputTokens?: number; outputTokens?: number; totalTokens?: number; reasoningTokens?: number; finishReason?: string; turnPurpose?: string; turnPurposeSource?: 'active_turn' | 'stage_fallback'; internalPurpose?: 'unknown'; contextLimits?: {context: number; input: number; compactionReserved: number}; usage: 'unknown' | 'partial' | 'complete'; status: 'pending' | 'completed' | 'failed' | 'interrupted'; httpStatus?: number; settings?: Record<string, unknown>; settingsSha256?: string; requestedSettings?: Record<string, unknown>; requestedSettingsSha256?: string; parameterOmissions?: { parameter: 'reasoning_budget'; reason: 'nvidia_v2_model_runner_unsupported'; source: 'provider_rejection' | 'cached_provider_rejection'; observedAt: string }[]; answerReserve?: 'requested' | 'unavailable' | 'not_requested'; promptSha256?: string }[];
   profile?: RepositoryProfile;
   id: string; input: RunInput; createdAt: string; updatedAt: string; stage: Stage; outcome?: Outcome;
   issue?: Issue; baseSha?: string; baseTree?: string; branch?: string; worktree?: string; sourceHash?: string;
@@ -23,13 +41,13 @@ export interface Manifest {
   sessionId?: string; opencodeUrl?: string; agentContainer?: string; workerContainer?: string;
   tools: number; tokens: number; attempt: number; checks: CheckResult[]; graphReady: boolean; graphStale: boolean;
   regression?: FrozenRegression; candidate?: Candidate; verifiedTree?: string; verifiedCommit?: string;
-  // Title and description written from the final verified diff (the candidate explanation can mention reverted edits).
-  summary?: { title: string; explanation: string };
-  publication?: { state: 'pending' | 'created' | 'failed'; fork: string; head: string; base: string; url?: string; error?: string; };
+  publication?: { state: 'pending' | 'created' | 'failed'; fork: string; head: string; base: string; url?: string; error?: string; originalVerifiedCommit?: string; currentHead?: string; changedSinceVerification?: boolean; reviewState?: string; ciState?: string; claState?: string; inspectedAt?: string; inspectionErrors?: string[]; };
   error?: string; demo: boolean;
 }
 export interface Config {
+  modelTemperature: number; modelTopP: number; modelThinking: boolean; reasoningBudget: number;
   profile: RepositoryProfile; profilePath: string; providerBaseUrl: string; modelContext: number; modelMaxOutput: number;
+  modelInput: number; compactionReserved: number; allowUnverifiedContext: boolean; allowUnboundedReasoning: boolean;
   projectDir: string; stateDir: string; repoRoot: string; port: number; bind: string; model: string;
   fork: string; gitName: string; gitEmail: string; rustToolchain: string; docker: string;
   workerImage: string; agentImage: string; publisherImage: string; dockerNetwork: string;
@@ -38,3 +56,5 @@ export interface Config {
   nvidiaSecret: string; githubSecret: string;
 }
 import type { RepositoryProfile } from './profile.ts';
+
+import type { ProviderFailure, ProviderAttemptRecord } from './provider-health.ts';

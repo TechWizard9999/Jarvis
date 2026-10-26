@@ -8,6 +8,7 @@ import { doctor } from './doctor.ts';
 const config = loadConfig();
 const [command = 'help', ...argv] = process.argv.slice(2);
 function option(name: string) { const index = argv.indexOf(name); return index < 0 ? undefined : argv[index + 1]; }
+async function acceptance() { const file = option('--acceptance'); return file ? JSON.parse(await fs.readFile(file, 'utf8')) : undefined; }
 async function api(endpoint: string, method = 'GET', body?: unknown) {
   const token = (await fs.readFile(path.join(config.stateDir, 'ui-token'), 'utf8')).trim();
   const response = await fetch(`http://127.0.0.1:${config.port}${endpoint}`, { method, headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' }, body: body === undefined ? undefined : JSON.stringify(body) });
@@ -38,12 +39,12 @@ try {
   } else if (command === 'doctor') {
     const checks = await doctor(config); for (const c of checks) console.log(`${c.ok ? 'PASS' : c.required ? 'FAIL' : 'NOTE'} ${c.name}: ${c.detail}`); if (checks.some(c => c.required && !c.ok)) process.exitCode = 1;
   } else if (command === 'run') {
-    const response = await api('/api/runs', 'POST', { repo: option('--repo'), issue: option('--issue'), base: option('--base'), mode: option('--mode') || 'live', retrieval: option('--retrieval') || 'graph', publish: argv.includes('--publish') && !argv.includes('--no-publish') }); console.log(JSON.stringify(await response.json(), null, 2));
+    const response = await api('/api/runs', 'POST', { repo: option('--repo'), issue: option('--issue'), base: option('--base'), mode: option('--mode') || 'live', retrieval: option('--retrieval') || 'graph', publish: argv.includes('--publish') && !argv.includes('--no-publish'), acceptance: await acceptance(), allowCompeting: argv.includes('--allow-competing') }); console.log(JSON.stringify(await response.json(), null, 2));
   } else if (command === 'fix') {
     // One-step flow: issue URL -> live run on the profile's default clone -> streamed progress -> outcome, report and draft PR link.
-    const issue = argv.find(a => !a.startsWith('--') && a !== option('--repo')); if (!issue) throw new Error('Usage: fix ISSUE_URL [--repo PATH] [--no-publish]');
+    const issue = argv.find(a => !a.startsWith('--') && a !== option('--repo') && a !== option('--acceptance')); if (!issue) throw new Error('Usage: fix ISSUE_URL [--repo PATH] [--acceptance JSON_FILE] [--no-publish]');
     const repo = option('--repo') || path.join(config.repoRoot, config.profile.upstream.split('/')[1]);
-    const started = await (await api('/api/runs', 'POST', { repo, issue, mode: 'live', retrieval: 'graph', publish: !argv.includes('--no-publish') })).json(); const id = started.id || started.run?.id;
+    const started = await (await api('/api/runs', 'POST', { repo, issue, mode: 'live', retrieval: 'graph', publish: !argv.includes('--no-publish'), acceptance: await acceptance(), allowCompeting: argv.includes('--allow-competing') })).json(); const id = started.id || started.run?.id;
     console.log(`Run ${id} started for ${issue}`); await follow(id);
     const run = ((await (await api('/api/runs')).json()) as any[]).find(r => r.id === id) || {};
     console.log(`\nOutcome: ${run.outcome}\nRoot-cause report: ${path.join(config.stateDir, 'runs', id, 'report.md')}`);
@@ -62,6 +63,8 @@ try {
   } else if (command === 'demo') console.log(JSON.stringify(await (await api('/api/demo', 'POST')).json(), null, 2));
   else if (command === 'list') console.log(JSON.stringify(await (await api('/api/runs')).json(), null, 2));
   else if (command === 'cancel' || command === 'publish') console.log(JSON.stringify(await (await api(`/api/runs/${argv[0]}/${command}`, 'POST')).json(), null, 2));
+  else if (command === 'inspect-pr') console.log(JSON.stringify(await (await api(`/api/runs/${argv[0]}/publication`)).json(), null, 2));
+  else if (command === 'note') { if (!argv[0] || !option('--kind') || !option('--message')) throw new Error('Usage: note ID --kind guidance|manual_fix|harness_fix|review --message TEXT'); console.log(JSON.stringify(await (await api(`/api/runs/${argv[0]}/interventions`,'POST',{kind:option('--kind'),message:option('--message')})).json(),null,2)); }
   else if (command === 'tail') await follow(argv[0]);
-  else console.log('Commands: serve, doctor, ask "PROMPT" [--system TEXT] [--model ID] [--json], fix ISSUE_URL [--no-publish], run --repo PATH --issue URL [--publish] [--mode evaluation --base SHA --no-publish], list, tail ID, cancel ID, publish ID, demo. Use ./bugfix for Docker setup/build/up/clone commands.');
+  else console.log('Commands: serve, doctor, ask "PROMPT" [--system TEXT] [--model ID] [--json], fix ISSUE_URL [--no-publish], run --repo PATH --issue URL [--publish] [--mode evaluation --base SHA --no-publish], list, tail ID, cancel ID, publish ID, inspect-pr ID, note ID --kind KIND --message TEXT, demo. Use ./bugfix for Docker setup/build/up/clone commands.');
 } catch (e) { console.error(e instanceof Error ? e.message : String(e)); process.exitCode = 1; }
